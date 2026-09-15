@@ -40,6 +40,7 @@ Options:
                        Default: 15° × UTC offset of the local timezone captured at startup.
       --utc            Clock in UTC; central meridian 0°
       --twilight       Also draw the civil twilight (−6°) curve
+      --no-outline     Do not draw the one-dot outline around the map oval
       --ascii          Render without braille ('#' land, '.' terminator) for limited fonts
       --color <WHEN>   When to use color: auto | always | never  [default: auto]
       --once           Render one frame to stdout and exit (implied when stdout is not a TTY)
@@ -57,6 +58,7 @@ Options:
 | `u` | toggle UTC/local clock |
 | `c` | re-center the map to the current timezone |
 | `t` | toggle the civil twilight curve |
+| `o` | toggle the map-oval outline |
 | `r` | force repaint |
 
 ### Examples
@@ -66,6 +68,7 @@ daylight                  # interactive; centered on your timezone
 daylight --utc            # UTC clock, Greenwich-centered map
 daylight --center 90      # map centered on 90°E
 daylight --twilight       # also draw the −6° twilight curve
+daylight --no-outline     # no map-oval outline
 daylight --ascii          # '#'/'.' glyphs instead of braille
 daylight --once > map.txt # one static frame (also automatic when piping)
 ```

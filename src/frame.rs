@@ -54,7 +54,7 @@ impl Cell {
         style: Style::Blank,
     };
 }
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Debug)]
 pub struct Frame {
     pub w: usize,
     pub h: usize,
@@ -86,6 +86,8 @@ pub struct RenderParams<'a> {
     pub rings: &'a [coast::Ring],
     pub sun: Sun,
     pub draw_twilight_curve: bool,
+    /// One-dot outline around the map oval, drawn in the terrain color.
+    pub draw_oval_outline: bool,
     pub ascii: bool,        // '#' land, '.' terminator instead of braille
     pub clock_line: String, // pre-rendered, may be truncated by composer
 }
@@ -127,22 +129,36 @@ pub fn compose(p: &RenderParams) -> Frame {
         }
     }
 
-    // Per-cell oval membership at dot granularity: which of the 2x4 braille dots of
-    // each cell lie inside the map oval. This keeps the map border on the dot grid
-    // (sub-cell detail) instead of stepping in whole cells. Same bit layout as
-    // raster's CELL_BITS (left column dots 1,2,3,7; right column dots 4,5,6,8).
+    // Dot-granular oval membership: which dots lie inside the map oval. This keeps
+    // the map border on the dot grid (sub-cell detail) instead of stepping in whole
+    // cells, and lets us trace a one-dot outline around the oval: a dot that is
+    // inside with at least one 4-neighbor outside (or off the grid) is on the rim.
+    // The rim is OR-ed into the land layer, so it renders in the terrain color
+    // (land style of the cell's own shading).
+    let inside = |dx: usize, dy: usize| -> bool {
+        dx < dots_w && dy < dots_h && mf.dot_to_lonlat(dx, dy).is_some()
+    };
     const CELL_BITS: [[u8; 4]; 2] = [[0x01, 0x02, 0x04, 0x40], [0x08, 0x10, 0x20, 0x80]];
     let mut oval_masks: Vec<u8> = vec![0u8; map_cols * map_rows];
+    let mut rim_masks: Vec<u8> = vec![0u8; map_cols * map_rows];
     let mut shade_dots: Vec<(usize, usize)> = vec![(0, 0); map_cols * map_rows];
     for cy in 0..map_rows {
         for cx in 0..map_cols {
             let mut mask = 0u8;
+            let mut rim = 0u8;
             let mut shade: Option<(usize, usize)> = None;
             for (col, bits_col) in CELL_BITS.iter().enumerate() {
                 for (row, bit) in bits_col.iter().enumerate() {
                     let (dx, dy) = (2 * cx + col, 4 * cy + row);
-                    if mf.dot_to_lonlat(dx, dy).is_some() {
+                    if inside(dx, dy) {
                         mask |= bit;
+                        let edge = !inside(dx.saturating_sub(1), dy)
+                            || !inside(dx + 1, dy)
+                            || !inside(dx, dy.saturating_sub(1))
+                            || !inside(dx, dy + 1);
+                        if edge {
+                            rim |= bit;
+                        }
                         // Prefer the cell's center-ish dot (right column, third row)
                         // for the shading sample; any inside dot as fallback.
                         if shade.is_none() || (dx, dy) == (2 * cx + 1, 4 * cy + 2) {
@@ -153,6 +169,7 @@ pub fn compose(p: &RenderParams) -> Frame {
             }
             let i = cy * map_cols + cx;
             oval_masks[i] = mask;
+            rim_masks[i] = if p.draw_oval_outline { rim } else { 0 };
             shade_dots[i] = shade.unwrap_or((2 * cx + 1, 4 * cy + 2));
         }
     }
@@ -170,8 +187,9 @@ pub fn compose(p: &RenderParams) -> Frame {
                 .dot_to_lonlat(shade_dots[i].0, shade_dots[i].1)
                 .expect("shade dot was verified inside the oval");
             let (lon_deg, lat_deg) = (lon_rad.to_degrees(), lat_rad.to_degrees());
-            // Land dots outside the oval (the scanline fills to the grid edge) drop.
-            let land_mask = land.cell_mask(cx, cy) & oval_mask;
+            // Land dots outside the oval (the scanline fills to the grid edge) drop;
+            // the oval rim (when enabled) is drawn in the terrain color like land.
+            let land_mask = (land.cell_mask(cx, cy) & oval_mask) | rim_masks[i];
             let curve_mask = terminator.cell_mask(cx, cy) | twilight.cell_mask(cx, cy);
             let shading = solar::shading(solar::elevation_deg(lat_deg, lon_deg, &p.sun));
             let cell = if p.ascii {
@@ -484,6 +502,7 @@ mod tests {
             rings,
             sun,
             draw_twilight_curve: twilight,
+            draw_oval_outline: true,
             ascii,
             clock_line: clock.to_string(),
         }
@@ -1425,5 +1444,124 @@ mod tests {
             "no cursor moves in plain output"
         );
         assert!(s.ends_with("\n"));
+    }
+}
+
+#[cfg(test)]
+mod oval_outline_tests {
+    use super::*;
+    use chrono::{TimeZone, Utc};
+
+    fn base_params<'a>(rings: &'a [coast::Ring], outline: bool) -> RenderParams<'a> {
+        let t = Utc.with_ymd_and_hms(2024, 6, 21, 12, 0, 0).unwrap();
+        RenderParams {
+            w: 80,
+            h: 24,
+            lambda0_deg: 0.0,
+            rings,
+            sun: crate::solar::subsolar(t),
+            draw_twilight_curve: false,
+            draw_oval_outline: outline,
+            ascii: false,
+            clock_line: "clock".to_string(),
+        }
+    }
+
+    /// The toggle changes only rim dots: with the outline on, every dot added or
+    /// removed relative to outline-off lies on the oval rim (inside with an
+    /// outside 4-neighbor), and rim cells render in the terrain (land) style.
+    #[test]
+    fn oval_outline_draws_rim_in_terrain_style() {
+        let rings: Vec<coast::Ring> = vec![]; // empty world: only the rim remains
+        let f_on = compose(&base_params(&rings, true));
+        let f_off = compose(&base_params(&rings, false));
+
+        assert_ne!(f_on, f_off);
+
+        // With no land at all, the outline-off frame shows only the terminator;
+        // with it on, every cell that was blank and is now non-blank is a rim
+        // With no land at all, the outline-off frame shows sea cells (styled
+        // spaces) inside the oval and blanks outside; turning the outline on must
+        // convert a ring of *sea* cells (never blank/outside ones) into
+        // terrain-styled glyph cells.
+        let mut rim_cells = 0usize;
+        for y in 0..f_on.h - 1 {
+            for x in 0..f_on.w {
+                let on = f_on.get(x, y);
+                let off = f_off.get(x, y);
+                let was_sea = matches!(off.style, Style::DaySea | Style::TwiSea | Style::NightSea);
+                let is_land =
+                    matches!(on.style, Style::DayLand | Style::TwiLand | Style::NightLand);
+                if is_land {
+                    // No land rings exist: any land-styled cell is rim.
+                    assert!(
+                        was_sea,
+                        "rim appeared outside the oval at ({x},{y}); off was {:?}",
+                        off
+                    );
+                    assert_ne!(on.sym, ' ');
+                    rim_cells += 1;
+                } else if off == Cell::BLANK {
+                    assert_eq!(
+                        on,
+                        Cell::BLANK,
+                        "outline must not draw outside the oval at ({x},{y})"
+                    );
+                } else {
+                    // Sea cells stay sea; terminator cells keep their style but may
+                    // gain rim dots into their glyph (same merge rule as land dots).
+                    assert!(
+                        was_sea || off.style == Style::Terminator,
+                        "unexpected cell change at ({x},{y}): {:?} -> {:?}",
+                        off,
+                        on
+                    );
+                }
+            }
+        }
+        // The rim hugs the oval: present on many rows, but a strictly interior
+        // cell (middle of the map) stays plain sea (no rim dots).
+        assert!(
+            rim_cells > 40,
+            "expected a substantial rim, got {rim_cells}"
+        );
+        let interior = f_on.get(40, 8);
+        assert_eq!(interior.sym, ' ', "map interior must have no glyph dots");
+        assert!(
+            matches!(
+                interior.style,
+                Style::DaySea | Style::TwiSea | Style::NightSea
+            ),
+            "map interior stays sea, got {:?}",
+            interior.style
+        );
+    }
+
+    /// With real land, the outline only ever adds dots — the map content is
+    /// unchanged, and rim dots never appear outside the oval.
+    #[test]
+    fn oval_outline_only_adds_on_real_data() {
+        let rings = crate::coast::decode(crate::coast_data::LAND_DATA);
+        let f_on = compose(&base_params(&rings, true));
+        let f_off = compose(&base_params(&rings, false));
+        for y in 0..f_on.h {
+            for x in 0..f_on.w {
+                let (a, b) = (f_off.get(x, y), f_on.get(x, y));
+                if (a.sym as u32) >= 0x2800 && (a.sym as u32) <= 0x28FF {
+                    let (ma, mb) = (a.sym as u32 - 0x2800, b.sym as u32 - 0x2800);
+                    assert_eq!(
+                        ma & !mb,
+                        0,
+                        "outline lost dots at ({x},{y}): {:08b} -> {:08b}",
+                        ma,
+                        mb
+                    );
+                }
+                if a != Cell::BLANK && a.sym != ' ' {
+                    // previously non-blank cells keep a glyph
+                    assert_ne!(b.sym, ' ', "cell ({x},{y}) must keep its glyph");
+                }
+            }
+        }
     }
 }
