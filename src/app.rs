@@ -38,7 +38,6 @@ fn run_once(cfg: &Config, color: bool, rings: &[coast::Ring]) -> i32 {
         rings,
         sun,
         draw_twilight_curve: cfg.twilight,
-        draw_coastline: cfg.coastline,
         ascii: cfg.ascii,
         clock_line: frame::clock_line(clock, &sun),
     });
@@ -73,7 +72,6 @@ struct App {
     lambda0_deg: f64,
     use_utc: bool,
     twilight: bool,
-    coastline: bool,
     ascii: bool,
     color: bool,
     rings: Vec<coast::Ring>,
@@ -99,7 +97,6 @@ impl App {
             rings: &self.rings,
             sun,
             draw_twilight_curve: self.twilight,
-            draw_coastline: self.coastline,
             ascii: self.ascii,
             clock_line: frame::clock_line(clock, &sun),
         });
@@ -137,10 +134,6 @@ impl App {
                 self.twilight = !self.twilight;
                 Some(LoopCtl::DirtyFull)
             }
-            (KeyCode::Char('o') | KeyCode::Char('O'), _) => {
-                self.coastline = !self.coastline;
-                Some(LoopCtl::DirtyFull)
-            }
             (KeyCode::Char('r') | KeyCode::Char('R'), _) => Some(LoopCtl::DirtyFull),
             _ => None,
         }
@@ -168,7 +161,6 @@ fn run_interactive(cfg: &Config, color: bool, rings: &[coast::Ring]) -> i32 {
         lambda0_deg: effective_center(cfg),
         use_utc: cfg.utc,
         twilight: cfg.twilight,
-        coastline: cfg.coastline,
         ascii: cfg.ascii,
         color,
         rings: rings.to_vec(),
