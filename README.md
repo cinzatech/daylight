@@ -38,26 +38,69 @@ Terminal day/night world clock: Kavrayskiy VII map, real-time terminator, braill
 Usage: daylight [OPTIONS]
 
 Options:
-      --center <DEG>   Central meridian, degrees east [-180..180].
-                       Default: 15° × UTC offset of the local timezone captured at startup.
-      --utc            Clock in UTC; central meridian 0°
-      --twilight       Also draw the civil twilight (−6°) curve
-      --no-outline     Do not draw the one-dot outline around the map oval
-      --no-rotate      Do not slowly rotate the map (one turn in ~6 min)
-      --interval <MS>  Redraw interval while rotating [default: 100]
-      --ascii          Render without braille ('#' land, '.' terminator) for limited fonts
-      --color <WHEN>   When to use color: auto | always | never  [default: auto]
-      --once           Render one frame to stdout and exit (implied when stdout is not a TTY)
-  -h, --help           Print help
-  -V, --version        Print version
+      --center <DEG>
+          Central meridian, degrees east [-180..180]. Takes precedence over `--utc` for the map meridian (the clock stays UTC).
+          
+          Default: 15° × UTC offset of the local timezone captured at startup, so your longitude sits near the map center.
+
+      --utc
+          Clock in UTC; central meridian 0°
+
+      --twilight
+          Also draw the civil twilight (−6°) curve
+
+      --no-outline
+          Do not draw the one-dot outline around the map oval
+
+      --no-rotate
+          Do not slowly rotate the map (one full turn in ~6 minutes)
+
+      --interval <MS>
+          Redraw interval in milliseconds while rotating [10..1000]
+          
+          [default: 100]
+
+      --ascii
+          Render without braille ('#' land, '.' terminator) for limited fonts
+
+      --color <COLOR>
+          When to use color: auto | always | never
+          
+          [default: auto]
+          [possible values: auto, always, never]
+
+      --once
+          Render one frame to stdout and exit (implied when stdout is not a TTY)
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+Interactive keys (letter keys are case-insensitive):
+  q, Esc, Ctrl-C    quit (Ctrl-C exits 130)
+  Ctrl-Z            suspend (restore on resume)
+  u                 toggle UTC/local clock
+  c                 re-center map to current timezone
+  t                 toggle twilight curve
+  o                 toggle map-oval outline
+  a                 toggle slow rotation
+  r                 force repaint
+
+The clock runs in the timezone current at startup (or UTC with --utc); only the
+map center is pinned at startup — press c to re-center live.
 ```
 
 ### Interactive keys
+
+All letter keys accept uppercase too.
 
 | Key | Action |
 | --- | --- |
 | `q`, `Esc` | quit |
 | `Ctrl-C` | quit (exit code 130) |
+| `Ctrl-\` | quit (exit code 131; terminal restored) |
 | `Ctrl-Z` | suspend; the terminal is restored and repainted on resume |
 | `u` | toggle UTC/local clock |
 | `c` | re-center the map to the current timezone |
@@ -72,6 +115,7 @@ Options:
 daylight                  # interactive; centered on your timezone
 daylight --utc            # UTC clock, Greenwich-centered map
 daylight --center 90      # map centered on 90°E
+daylight --center -120    # negative values work too
 daylight --twilight       # also draw the −6° twilight curve
 daylight --no-outline     # no map-oval outline
 daylight --no-rotate      # static map instead of slow rotation
@@ -91,10 +135,11 @@ daylight --once > map.txt # one static frame (also automatic when piping)
   palette is respected on every computer.
 - Well-mannered terminal citizen: alternate screen, symmetric raw-mode
   setup/teardown (also on panics and signals), no bell, no mouse capture, scrollback
-  untouched. Exit codes: 0 clean, 2 usage error, 1 runtime error, 130/143/129 for
-  INT/TERM/HUP.
-- Lean: while idle the process is blocked on terminal input (~0% CPU); frames are
-  diffed and only changed cells are written.
+  untouched. Exit codes: 0 clean, 2 usage error, 1 runtime error (including stdout
+  write failures), 130/143/129/131 for INT/TERM/HUP/QUIT.
+- Lean: while idle (rotation off) the process is blocked on terminal input (~0% CPU);
+  while rotating it redraws every 100 ms. Frames are diffed and only changed cells
+  are written; the land polygons are preprocessed once at startup.
 
 ## Development
 
@@ -110,7 +155,9 @@ Map data can be regenerated from `data/ne_110m_land.geojson`:
 cargo run --example datagen -- data/ne_110m_land.geojson
 ```
 
-See [PLAN.md](PLAN.md) for the full design and requirements. Linux/UNIX only.
+See [PLAN.md](PLAN.md) — the original design plan, decision records, and risk
+log (kept as a historical record) — and [CHANGELOG.md](CHANGELOG.md) for
+changes over time. Linux/UNIX only.
 
 ## License
 

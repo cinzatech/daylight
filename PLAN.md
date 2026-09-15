@@ -1,5 +1,11 @@
 # PLAN — `daylight`: a terminal day/night world clock
 
+> **Status: design record (frozen).** This document is the original plan and
+> decision record for daylight v1.0.0. It is kept for rationale and history —
+> not as a living specification. The living documentation is the README plus
+> the source modules' own docs; behavioral changes after 1.0.0 are recorded in
+> CHANGELOG.md. Code comments citing “PLAN §N” point here for provenance.
+>
 > **Deviation (user-directed, §15 rule):** R5 (single-file `src/main.rs`) is dropped.
 > The application uses proper modularization under `src/` (`cli`, `solar`, `geo`, `coast`,
 > `coast_data`, `raster`, `frame`, `term`, `app`), with integration tests in `tests/`.
@@ -115,8 +121,9 @@ Data flow (all pure functions, no hidden state — this is what makes it testabl
 
 ```text
 Cargo.toml
-src/main.rs               the entire application (+ inline tests)
-examples/datagen.rs       Rust tool: NE GeoJSON → encoded const, spliced into src/main.rs
+src/main.rs               arg parsing, mode dispatch (see the deviation note above: the
+                          app is modularized under src/, with generated data in src/coast_data.rs)
+examples/datagen.rs       Rust tool: NE GeoJSON → encoded const, spliced into src/coast_data.rs
 data/ne_110m_land.geojson committed source data (public domain, provenance in §7)
 PLAN.md
 ```
@@ -153,17 +160,21 @@ Screen y grows downward → flip. Cells whose inverse lands outside the map oval
 
 ### 6.2 Solar position — NOAA "General Solar Position Calculations" (gml.noaa.gov)
 
-Low-precision (±0.01° declination, valid across ~1950–2050, far beyond visual need):
+Low-precision series, valid across ~1950–2050. Accuracy: ~±0.5° in declination
+(the Spencer series' native 0.01 **radian** error — below one dot row) and ≲1 min
+in the equation of time:
 
 ```text
-γ      = 2π/365 · (day_of_year − 1 + (UTC_hours − 12)/24)     (366 in leap years)
+γ      = 2π/365 · (day_of_year − 1 + (UTC_hours − 12)/24)     (365 always: the series is
+                                                              phase-calibrated for it; a
+                                                              leap-year 366 measurably worsens it)
 eqtime = 229.18 · (0.000075 + 0.001868 cos γ − 0.032077 sin γ
                   − 0.014615 cos 2γ − 0.040849 sin 2γ)          [minutes]
 δ      = 0.006918 − 0.399912 cos γ + 0.070257 sin γ − 0.006758 cos 2γ
          + 0.000907 sin 2γ − 0.002697 cos 3γ + 0.00148 sin 3γ   [radians]
 
 subsolar point:  lat = δ
-                 lon = −15° · (UTC_decimal_hours + eqtime/60), normalized to (−180, 180]
+                 lon = −15° · (UTC_decimal_hours − 12 + eqtime/60), normalized to (−180, 180]
 ```
 
 Sun elevation at (φ, λ) — spherical Earth, hour angle H = λ − lon_subsolar (degrees):
@@ -195,19 +206,22 @@ no global mutable state; all functions take values and return values (pure → t
   (one dot ≈ 0.5–1° at typical sizes).
 - **Committed:** `data/ne_110m_land.geojson` (data, not code; ~a few hundred KB) so builds
   and regeneration never touch the network.
-- **Encoding** (produced by `examples/datagen.rs`, spliced into `src/main.rs` between
+- **Encoding** (produced by `examples/datagen.rs`, spliced into `src/coast_data.rs` between
   `// @generated BEGIN` / `// @generated END` markers as a single `static LAND_DATA: &str`):
   vertices rounded to 2 decimals (±0.005° ≈ 550 m, below source resolution), per-ring
   zigzag varint deltas of centidegrees, base85-encoded. Expected ~10–20 KB of string for
   ~5–7k vertices (verified at M3; if it exceeds 40 KB, revisit quantization).
 - **Regeneration** (documented in the file header comment):
   `cargo run --example datagen -- data/ne_110m_land.geojson`
-  The tool parses GeoJSON (`serde_json`), encodes, and rewrites the marked region of
-  `src/main.rs` in place. Idempotent; diff-friendly (single line, `#[rustfmt::skip]`).
+  The tool parses GeoJSON (`serde_json`), validates the data contracts (per-vertex bounds,
+  minimum ring size, pre-split-at-antimeridian edges — see §8), encodes, and rewrites the
+  marked region of `src/coast_data.rs` in place. Idempotent; diff-friendly (single line,
+  `#[rustfmt::skip]`).
 - **Decoder** (in-app, ~40 lines): base85 → varints → Δ-centidegrees → `Vec<Polygon>`,
   where `Polygon = Vec<(f64 lat, f64 lon)>` rings. Even-odd semantics.
-  Natural Earth polygons are already split at the antimeridian; after central-meridian
-  rotation, segments whose Δλ exceeds 180° are split at ±180° during rendering (§8).
+  Natural Earth polygons are already split at the antimeridian; the rasterizer *requires*
+  that (its edge builder enforces it — non-horizontal edges must span ≤ 180°) and handles
+  the central-meridian rotation at span-fill time (§8).
 
 ---
 
@@ -230,11 +244,19 @@ this projection, every dot *row* is a single latitude φ_row. For each dot row:
    even-odd rule; vertex-exact rows nudged by a tiny ε — standard scanline trick).
 2. Sort crossings; fill spans pairwise, converting each span's longitudes to x via the
    forward formula (x is linear in λ at fixed φ) and thus to dot columns.
-3. Dateline: segments spanning >180° after rotation are split at ±180° before crossing tests.
-   Antarctica/pole handling falls out of even-odd on the committed rings (probe-tested).
+3. Dateline: the fill runs in **raw source coordinates** on rings that Natural Earth
+   already splits at the antimeridian (every non-horizontal edge ≤ 180° — enforced with
+   a panic when the edges are built, and validated by datagen at generation time).
+   Spans wider than the rotated map window wrap at fill time (split at ±180 relative
+   to λ₀). Antarctica/pole handling falls out of even-odd on the committed rings
+   (probe-tested).
 
-Complexity per (re)build: O(rows × edges + fills); only on resize. Map *never* needs
-recomputation per tick — only shading/terminator do (§10).
+Complexity per (re)build: O(rows × edges + fills). The edge list itself is built once
+at startup (`raster::LandEdges`), not per frame. While rotating (the default) the map
+layer *is* recomposed per interval tick — the shading/terminator/clock genuinely
+change with λ₀ — and the oval-membership grid is recomputed per compose (it is
+independent of the sun and λ₀). With `--no-rotate`, rebuilds happen only on second/minute
+boundaries, resize, and interactive toggles, as §9/§10 originally promised.
 
 **Layers composed per cell:**
 
@@ -250,9 +272,10 @@ recomputation per tick — only shading/terminator do (§10).
 
 **Colors.** Theme (fixed, tasteful): day sea = default bg, day land = bright fg;
 night = dimmed fg + dark bg; twilight band = intermediate; terminator = accent. Dim/bold
-SGR carries night/day even on color-less terminals. 256-color indexes when `TERM` suggests
-support, basic 16 otherwise, mono when `NO_COLOR` or `TERM=dumb` or `--color never`
-(shading then relies on dim attribute; mono fallback still legible: land dots vs. blank sea
+SGR carries night/day even on color-less terminals. Only the **16 standard ANSI colors**
+(30–37, 90–97) are used, so the user's terminal theme supplies the hues everywhere;
+mono when `NO_COLOR` (non-empty) or `TERM=dumb` or `--color never` (shading then relies on
+dim attribute; mono fallback still legible: land dots vs. blank sea
 
 - terminator dots). `--ascii` flag renders without braille (`#` land, `.` terminator) for
 fonts lacking braille glyphs.
@@ -278,12 +301,12 @@ to the previous hook — terminal state survives panics. Suspension (Ctrl-Z key 
 restore → reset SIGTSTP to default → raise it (the recipe from signal-hook's own docs);
 on SIGCONT: re-init raw mode + screen, invalidate the frame cache, full redraw.
 
-**Signals.** `signal-hook` for INT, TERM, HUP, TSTP, CONT. Raw mode turns off ISIG, so
+**Signals.** `signal-hook` for INT, TERM, HUP, QUIT, TSTP, CONT. Raw mode turns off ISIG, so
 Ctrl-C/Ctrl-Z arrive as ordinary crossterm key events and take the same code paths as
 external signals; `kill`-delivered signals flip atomic flags checked on every loop wake
 (≤ 1 s latency — the loop wakes each second regardless). Exit codes after restore:
-SIGINT→130, SIGTERM→143, SIGHUP→129 (128+n convention). SIGWINCH is handled inside
-crossterm and surfaced as `Event::Resize`.
+SIGINT→130, SIGTERM→143, SIGHUP→129, SIGQUIT→131 (128+n convention). SIGWINCH is handled
+inside crossterm and surfaced as `Event::Resize`.
 
 **Input.** crossterm owns all terminal input decoding — key events, modifiers, and
 lone-Esc vs. escape-sequence disambiguation. No hand-rolled input parsing anywhere.
@@ -308,8 +331,10 @@ loop {
 }
 ```
 
-If there is no usable controlling terminal, `event::poll` is skipped in favor of sleeping
-to the next second — still zero busy-waiting; keys are unavailable, signals still honored.
+If there is no usable controlling terminal the loop degrades safely: a persistent
+`event::poll` *error* (rather than readiness) falls back to sleeping the intended
+timeout in bounded slices — still zero busy-waiting; keys are unavailable, signals
+still honored.
 
 Recompute budget per second wake is O(cells) trig (sub-millisecond in release) and only
 touches the frame when something actually changed (second/minute/resize). While idle the
@@ -344,7 +369,8 @@ exit 0. `--once` forces the same path even on a TTY.
 - Cursor hidden and restored; no cursor litter between frames (diff moves cursor only to changed runs).
 - Raw mode entered/exited symmetrically; restored on quit, signals, and panics.
 - `^Z`/`fg` job control works (restore on TSTP, re-init + full repaint on CONT).
-- Exit codes: 0 clean; 2 usage (clap); 1 runtime error; 130/143/129 for INT/TERM/HUP.
+- Exit codes: 0 clean; 2 usage (clap); 1 runtime error (incl. stdout write failures);
+  130/143/129/131 for INT/TERM/HUP/QUIT.
 - Errors/diagnostics → stderr, rendering → stdout; nothing extraneous on either.
 - Honors `NO_COLOR`, `TERM=dumb`, non-TTY stdout (one-shot), missing stdin (no keys, still runs).
 - No bell, no mouse capture, no title changes; autowrap disabled only while we own the screen.
@@ -362,6 +388,9 @@ Options:
                        Default: 15° × UTC offset of the local timezone captured at startup.
       --utc            Clock in UTC; central meridian 0° (shorthand for the default center).
       --twilight       Also draw the civil twilight (−6°) curve.
+      --no-outline     Do not draw the one-dot outline around the map oval.
+      --no-rotate      Do not slowly rotate the map (one full turn in ~6 minutes).
+      --interval <MS>  Redraw interval in milliseconds while rotating [10..1000]. [default: 100]
       --ascii          Render without braille ('#' land, '.' terminator) for limited fonts.
       --color <WHEN>   auto | always | never  [default: auto]
       --once           Render one frame to stdout and exit (implied when stdout is not a TTY).
@@ -370,7 +399,8 @@ Options:
 ```
 
 Interactive keys: `q`, `Esc`, `Ctrl-C` quit · `Ctrl-Z` suspend · `u` toggle UTC/local clock · `c` re-center to
-current timezone · `t` toggle twilight · `r` force repaint. `--help` documents them.
+current timezone · `t` toggle twilight · `o` toggle oval outline · `a` toggle rotation · `r` force repaint.
+`--help` documents them.
 
 ---
 
@@ -407,8 +437,8 @@ contains SGR, `--color never` contains none.
 ### 14.3 PTY integration tests (`portable-pty`, cfg(unix))
 
 - Launch in pty → alt-screen enter + braille glyphs present; send `q` → exit 0, output tail
-  contains restore sequences (`?1049l`, `?25h`), termios restored (verified from parent via
-  pty attributes).
+  contains restore sequences (`?1049l`, `?25h`; the restore sequences themselves are the
+  asserted evidence, read from the mirrored pty output).
 - Send Ctrl-C byte → clean exit 130 with restore sequences.
 - `kill(SIGTERM)` → exit 143 with restore sequences.
 - Resize pty → app repaints at new size (frame width changes, no crash).
@@ -458,7 +488,9 @@ the same commit (decision-record discipline).
 
 ## 16. Definition of Done
 
-- [x] `cargo test` green — every test named in §14 exists and passes (77 unit + 8 self-spawn CLI + 6 pty = 91).
+- [x] `cargo test` green — the suite named in §14 plus later additions (91 unit + 11
+      self-spawn CLI + 11 pty = 113; post-1.0 review added signal/color-env/interval
+      coverage).
 - [x] `cargo fmt --check` clean; `cargo clippy --all-targets -- -D warnings` clean.
 - [x] Fixed-instant frame tests prove: recognizable land (probes), correct day/night
       asymmetry at both solstices and equinox, terminator dots on the analytic curve,
