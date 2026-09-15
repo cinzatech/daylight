@@ -31,6 +31,10 @@ pub struct Args {
     #[arg(long)]
     pub no_rotate: bool,
 
+    /// Redraw interval in milliseconds while rotating [default: 100].
+    #[arg(long, value_name = "MS", default_value_t = 100)]
+    pub interval_ms: u64,
+
     /// Render without braille ('#' land, '.' terminator) for limited fonts.
     #[arg(long)]
     pub ascii: bool,
@@ -78,6 +82,7 @@ pub struct Config {
     pub twilight: bool,
     pub outline: bool,
     pub rotate: bool,
+    pub interval_ms: u64,
     pub ascii: bool,
     pub color: ColorWhen,
     pub once: bool,
@@ -111,6 +116,7 @@ pub fn parse() -> Config {
         twilight: args.twilight,
         outline: !args.no_outline,
         rotate: !args.no_rotate,
+        interval_ms: args.interval_ms,
         ascii: args.ascii,
         color: match args.color {
             ColorArg::Auto => ColorWhen::Auto,

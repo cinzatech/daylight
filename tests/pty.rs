@@ -428,8 +428,9 @@ fn cpu_ticks(pid: u32) -> Option<u64> {
 fn idle_cpu_is_negligible() {
     // PLAN §10/§14.3: the event loop blocks in poll — under 100 ms of CPU
     // over a 2.5 s idle window. /proc ticks are 100/s on stock kernels, so
-    // the budget is 10 ticks.
-    let mut s = Session::launch(&[]);
+    // the budget is 10 ticks. With rotation on the app is (lightly) working,
+    // so this asserts the truly idle path.
+    let mut s = Session::launch(&["--no-rotate"]);
     assert!(
         wait_for(&s, b"\x1b[?1049h", TIMEOUT),
         "app did not start; tail: {}",

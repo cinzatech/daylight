@@ -44,6 +44,7 @@ Options:
       --twilight       Also draw the civil twilight (−6°) curve
       --no-outline     Do not draw the one-dot outline around the map oval
       --no-rotate      Do not slowly rotate the map (one turn in ~6 min)
+      --interval <MS>  Redraw interval while rotating [default: 100]
       --ascii          Render without braille ('#' land, '.' terminator) for limited fonts
       --color <WHEN>   When to use color: auto | always | never  [default: auto]
       --once           Render one frame to stdout and exit (implied when stdout is not a TTY)
@@ -83,7 +84,8 @@ daylight --once > map.txt # one static frame (also automatic when piping)
 - The clock runs in the timezone current at startup; DST transitions while running
   are still shown correctly. Only the map's central meridian is pinned at startup —
   press `c` to re-center live. By default the map slowly rotates eastward
-  (one full turn in ~6 minutes; `--no-rotate` or `a` to stop).
+  (one full turn in ~6 minutes; `--no-rotate` or `a` to stop), redrawing
+  every 100 ms for a fluid motion (tune with `--interval`).
 - Honors `NO_COLOR` and `TERM=dumb`; degrades to dim/bold attributes without color.
   Color output uses only the 16 standard ANSI colors, so your terminal theme's
   palette is respected on every computer.

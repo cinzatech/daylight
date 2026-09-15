@@ -75,6 +75,8 @@ struct App {
     twilight: bool,
     outline: bool,
     rotate: bool,
+    /// Redraw interval in ms while rotating (from --interval).
+    interval_ms: u64,
     ascii: bool,
     color: bool,
     rings: Vec<coast::Ring>,
@@ -196,6 +198,7 @@ fn run_interactive(cfg: &Config, color: bool, rings: &[coast::Ring]) -> i32 {
         twilight: cfg.twilight,
         outline: cfg.outline,
         rotate: cfg.rotate,
+        interval_ms: cfg.interval_ms,
         ascii: cfg.ascii,
         color,
         rings: rings.to_vec(),
@@ -237,8 +240,15 @@ fn run_interactive(cfg: &Config, color: bool, rings: &[coast::Ring]) -> i32 {
             app.last_second = Some(second_key);
         }
 
-        // Sleep/poll until the next whole second.
-        let timeout = std::time::Duration::from_millis(1000 - now.timestamp_subsec_millis() as u64);
+        // Sleep/poll until the next tick. While rotating we wake every 100 ms so
+        // the 1°/s motion renders fluidly (angle is wall-clock derived, so each
+        // frame is simply the correct position at that instant); otherwise the
+        // loop only needs to wake for the 1 Hz clock.
+        let timeout = if app.rotate {
+            std::time::Duration::from_millis(app.interval_ms.min(1000))
+        } else {
+            std::time::Duration::from_millis(1000 - now.timestamp_subsec_millis() as u64)
+        };
         if crossterm::event::poll(timeout).unwrap_or(false) {
             match crossterm::event::read() {
                 Ok(crossterm::event::Event::Key(k)) => {
