@@ -8,6 +8,8 @@ current date and time in your timezone.
     git clone … && cd daylight
     cargo run
 
+[<img alt="A screenshot showing the program in execution" src="docs/screenshot.png">](docs/screenshot.png)
+
 ## Installation
 
 Requires a Rust toolchain (1.74+). Build and install the release binary:
