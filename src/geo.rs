@@ -1,9 +1,10 @@
-//! Kavrayskiy VII projection and map-frame math. See INTERFACES.md (geo) and PLAN.md §6.1.
+//! Kavrayskiy VII projection and map-frame math. See PLAN.md §6.1.
 //!
-//! All angles are radians inside this module. `forward`/`inverse` work relative to a
-//! central meridian `lambda0`; `MapFrame` lays the projected oval over a dot grid
-//! (dots are ~square: terminal cells are 1:2 and braille packs 2x4 dots per cell),
-//! with `dy = 0` at the top (north) row.
+//! All angles are radians inside this module, except parameters and results
+//! named `*_deg` at the `MapFrame` boundary (degrees there).
+//! `forward`/`inverse` work relative to a central meridian `lambda0`; `MapFrame`
+//! lays the projected oval over a dot grid (dots are ~square: terminal cells are
+//! 1:2 and braille packs 2x4 dots per cell), with `dy = 0` at the top (north) row.
 
 use std::f64::consts::PI;
 
@@ -17,9 +18,16 @@ fn oval_half_width(lat: f64) -> f64 {
     1.5 * PI * (1.0 / 3.0 - (lat / PI) * (lat / PI)).sqrt()
 }
 
-/// Forward projection. lon/lat/lambda0 in radians. Returns (x, y):
-/// x = 1.5*(lon-lambda0 normalized to (-pi,pi]) * sqrt(1/3 - (lat/pi)^2), y = lat.
+/// Forward projection. lon/lat/lambda0 in radians. The formulas are defined
+/// for |lat| < pi·sqrt(1/3) (~103.9°); beyond that the sqrt argument goes
+/// negative and x is NaN (a debug assert documents the boundary; MapFrame
+/// never projects beyond ±pi/2). Returns (x, y): x = 1.5*(lon-lambda0
+/// normalized to (-pi,pi]) * sqrt(1/3 - (lat/pi)^2), y = lat.
 pub fn forward(lon: f64, lat: f64, lambda0: f64) -> (f64, f64) {
+    debug_assert!(
+        (lat / PI) * (lat / PI) < 1.0 / 3.0,
+        "forward: |lat| beyond ~103.9 deg leaves the projection's sqrt domain"
+    );
     let lon_rel = normalize_lon(lon - lambda0);
     (
         1.5 * lon_rel * (1.0 / 3.0 - (lat / PI) * (lat / PI)).sqrt(),
@@ -27,16 +35,25 @@ pub fn forward(lon: f64, lat: f64, lambda0: f64) -> (f64, f64) {
     )
 }
 
-/// Inverse: returns (lon-lambda0 in (-pi,pi], lat). Total (sqrt arg never zero:
-/// |lat| <= pi/2 => (lat/pi)^2 <= 1/4 < 1/3).
+/// Inverse: returns (lon-lambda0 in (-pi,pi], lat). Total for |y| <= pi/2
+/// (sqrt arg never zero: (lat/pi)^2 <= 1/4 < 1/3); |y| beyond pi·sqrt(1/3)
+/// (~103.9°) leaves the sqrt domain (a debug assert documents the boundary).
 pub fn inverse(x: f64, y: f64) -> (f64, f64) {
+    debug_assert!(
+        (y / PI) * (y / PI) < 1.0 / 3.0,
+        "inverse: |y| beyond ~103.9 deg leaves the projection's sqrt domain"
+    );
     let lat = y;
     let lon_rel = 2.0 * x / (3.0 * (1.0 / 3.0 - (y / PI) * (y / PI)).sqrt());
     (normalize_lon(lon_rel), lat)
 }
 
-/// Any radians -> (-pi, pi]. The lower boundary -pi maps to +pi.
+/// Any radians -> (-pi, pi]. The lower boundary -pi maps to +pi. Non-finite
+/// input (NaN, ±inf) returns 0.0 so the documented total range always holds.
 pub fn normalize_lon(lon: f64) -> f64 {
+    if !lon.is_finite() {
+        return 0.0;
+    }
     let two_pi = 2.0 * PI;
     let mut l = lon % two_pi;
     if l <= -PI {
@@ -78,6 +95,13 @@ impl MapFrame {
     /// `pub(crate)`: the raster scanline must use the identical mapping so land and
     /// shading/terminator layers stay registered to the dot.
     pub(crate) fn scale(&self) -> f64 {
+        debug_assert!(
+            self.x_max > self.x_min
+                && self.y_max > self.y_min
+                && self.dots_w > 0
+                && self.dots_h > 0,
+            "MapFrame must be well-formed (build it with MapFrame::new)"
+        );
         let sx = self.dots_w as f64 / (self.x_max - self.x_min);
         let sy = self.dots_h as f64 / (self.y_max - self.y_min);
         if sx < sy {
@@ -98,7 +122,9 @@ impl MapFrame {
 
     /// Dot (dx, dy), dy=0 = top row (north). None if outside the map oval
     /// (|x| > 1.5·π·sqrt(1/3 - (lat/π)²), or |lat| > π/2, or off the grid).
-    /// Returns absolute (lon, lat) radians: lon = lon_offset + lambda0 in (-pi, pi].
+    /// Membership carries a tiny EPS tolerance: dot centers exactly on the
+    /// boundary count as inside. Returns absolute (lon, lat) radians:
+    /// lon = lon_offset + lambda0 in (-pi, pi].
     pub fn dot_to_lonlat(&self, dx: usize, dy: usize) -> Option<(f64, f64)> {
         if self.dots_w == 0 || self.dots_h == 0 || dx >= self.dots_w || dy >= self.dots_h {
             return None;
@@ -112,12 +138,17 @@ impl MapFrame {
     }
 
     /// Nearest dot for (lon_deg, lat_deg) degrees in. None if outside the oval
-    /// (invalid latitude, or the nearest dot's center lies off the oval).
+    /// (invalid latitude, or the nearest dot's center lies off the oval — with
+    /// the same EPS boundary tolerance as [`Self::dot_to_lonlat`]).
     pub fn lonlat_to_dot(&self, lon_deg: f64, lat_deg: f64) -> Option<(usize, usize)> {
         if self.dots_w == 0 || self.dots_h == 0 || !lon_deg.is_finite() || !lat_deg.is_finite() {
             return None;
         }
-        let (x, y) = forward(lon_deg.to_radians(), lat_deg.to_radians(), self.lambda0);
+        let lat = lat_deg.to_radians();
+        if lat.abs() > PI / 2.0 + EPS {
+            return None; // invalid latitude (beyond the poles)
+        }
+        let (x, y) = forward(lon_deg.to_radians(), lat, self.lambda0);
         if y.abs() > PI / 2.0 + EPS || x.abs() > oval_half_width(y) + EPS {
             return None;
         }
@@ -229,7 +260,7 @@ mod tests {
             -PI / 4.0,
             PI / 2.0,
             -PI / 2.0,
-            -2.3456,
+            -1.8, // beyond the poles, still inside the sqrt domain (~±103.9°)
         ] {
             let (_, y) = forward(0.7, lat, 0.3);
             assert_eq!(y, lat);

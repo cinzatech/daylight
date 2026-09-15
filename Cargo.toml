@@ -2,6 +2,7 @@
 name = "daylight"
 version = "1.0.0"
 edition = "2021"
+rust-version = "1.74"
 description = "Terminal day/night world clock: Kavrayskiy VII map, real-time terminator, braille rendering"
 license = "AGPL-3.0-or-later"
 
@@ -16,7 +17,6 @@ crossterm = "0.29"
 signal-hook = "0.4"
 
 [dev-dependencies]
-serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 portable-pty = "0.8"
 

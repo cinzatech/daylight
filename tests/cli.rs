@@ -12,12 +12,20 @@
 use std::io::Read;
 use std::process::{Command, Stdio};
 
+mod common;
+
 /// Spawn the built binary with `args`; stdin is piped and its write end
 /// closed immediately (EOF), stdout/stderr are piped and drained
 /// concurrently. Returns (stdout bytes, stderr bytes, exit code).
 fn spawn(args: &[&str]) -> (Vec<u8>, Vec<u8>, i32) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_daylight"))
-        .args(args)
+    spawn_env(args, &[])
+}
+
+/// [`spawn`] with extra environment variables layered over the inherited set.
+fn spawn_env(args: &[&str], envs: &[(&str, &str)]) -> (Vec<u8>, Vec<u8>, i32) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_daylight"));
+    cmd.args(args).envs(envs.iter().copied());
+    let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -43,9 +51,7 @@ fn spawn(args: &[&str]) -> (Vec<u8>, Vec<u8>, i32) {
 /// True if `bytes` contains any braille pattern char (U+2800..=U+28FF,
 /// UTF-8: E2 A0..A3 80..BF).
 fn has_braille(bytes: &[u8]) -> bool {
-    bytes
-        .windows(3)
-        .any(|w| w[0] == 0xE2 && (0xA0..=0xA3).contains(&w[1]) && (0x80..=0xBF).contains(&w[2]))
+    common::has_braille(bytes)
 }
 
 #[test]
@@ -97,7 +103,7 @@ fn help_documents_interactive_keys() {
             "--help must document the {needle} quit key; keys section was:\n{window}"
         );
     }
-    for key in ["q", "u", "c", "t", "r"] {
+    for key in ["q", "u", "c", "t", "o", "a", "r"] {
         let listed = window.contains(&format!("`{key}`"))
             || window.contains(&format!("{key},"))
             || window.contains(&format!(" {key} "));
@@ -131,6 +137,47 @@ fn center_out_of_range_is_usage_error() {
         out.is_empty(),
         "usage errors must not render a frame on stdout"
     );
+}
+
+#[test]
+fn center_boundaries_are_accepted() {
+    // The documented range is inclusive: both dateline meridians are valid.
+    for center in ["-180", "180"] {
+        let (out, err, code) = spawn(&["--center", center, "--once"]);
+        assert_eq!(code, 0, "--center {center} must be accepted");
+        assert!(err.is_empty(), "nothing on stderr: {err:?}");
+        assert!(has_braille(&out), "a frame must be rendered");
+    }
+}
+
+#[test]
+fn interval_bounds_are_validated() {
+    // 0 would busy-spin the rotating loop; > 1000 was silently clamped —
+    // both are usage errors now, with the range documented in --help.
+    for bad in ["0", "9", "1001", "60000"] {
+        let (out, err, code) = spawn(&["--interval", bad]);
+        assert_eq!(code, 2, "--interval {bad} must be a usage error");
+        assert!(!err.is_empty(), "the clap error must go to stderr");
+        assert!(out.is_empty(), "no frame on stdout");
+        assert!(
+            String::from_utf8_lossy(&err).contains("10, 1000"),
+            "error should state the valid range: {err:?}"
+        );
+    }
+    // The inclusive bounds themselves are accepted.
+    for good in ["10", "100", "1000"] {
+        let (out, _err, code) = spawn(&["--interval", good, "--once"]);
+        assert_eq!(code, 0, "--interval {good} must be accepted");
+        assert!(has_braille(&out));
+    }
+}
+
+#[test]
+fn no_color_does_not_override_explicit_always() {
+    // `--color always` beats NO_COLOR by documented precedence.
+    let (out, _err, code) = spawn_env(&["--color", "always", "--once"], &[("NO_COLOR", "1")]);
+    assert_eq!(code, 0);
+    assert!(out.contains(&0x1b), "--color always must win over NO_COLOR");
 }
 
 #[test]

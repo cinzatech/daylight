@@ -65,7 +65,7 @@ fn run() -> Result<(), String> {
     let root: serde_json::Value =
         serde_json::from_str(&input).map_err(|e| format!("invalid GeoJSON: {e}"))?;
 
-    let rings = extract_rings(&root);
+    let rings = extract_rings(&root)?;
     if rings.is_empty() {
         return Err("no polygon rings found in input".to_string());
     }
@@ -107,54 +107,106 @@ fn count_features(root: &serde_json::Value) -> usize {
         .map_or(0, |a| a.len())
 }
 
-/// Collect (lat, lon) rings from every feature, handling Polygon and MultiPolygon.
-fn extract_rings(root: &serde_json::Value) -> Vec<Vec<(f64, f64)>> {
+/// Collect (lat, lon) rings from every feature, handling Polygon and
+/// MultiPolygon. Every ring is validated against the wire format's and the
+/// rasterizer's data contracts (see below) — a wrong source file must fail
+/// loudly here, not corrupt the committed map.
+fn extract_rings(root: &serde_json::Value) -> Result<Vec<Vec<(f64, f64)>>, String> {
     let mut rings = Vec::new();
     let features = match root.get("features").and_then(|f| f.as_array()) {
         Some(f) => f,
-        None => return rings,
+        None => return Ok(rings),
     };
-    for feature in features {
+    for (fi, feature) in features.iter().enumerate() {
         let Some(geom) = feature.get("geometry") else {
             continue;
         };
         match geom.get("type").and_then(|t| t.as_str()) {
-            Some("Polygon") => push_rings(geom.get("coordinates"), &mut rings),
+            Some("Polygon") => push_rings(geom.get("coordinates"), &mut rings)
+                .map_err(|e| format!("feature {fi}: {e}"))?,
             Some("MultiPolygon") => {
                 if let Some(polys) = geom.get("coordinates").and_then(|c| c.as_array()) {
                     for poly in polys {
-                        push_rings(Some(poly), &mut rings);
+                        push_rings(Some(poly), &mut rings)
+                            .map_err(|e| format!("feature {fi}: {e}"))?;
                     }
                 }
             }
             _ => {}
         }
     }
-    rings
+    Ok(rings)
 }
 
-/// Append every ring of one Polygon's `coordinates` (array of rings of [lon, lat] points).
-fn push_rings(coords: Option<&serde_json::Value>, out: &mut Vec<Vec<(f64, f64)>>) {
+/// Append every ring of one Polygon's `coordinates` (array of rings of
+/// [lon, lat] points), validating:
+/// - every point is a numeric [lon, lat] pair within [-180..180] x [-90..90]
+///   (malformed points abort instead of being dropped silently);
+/// - rings carry at least 3 vertices;
+/// - the rasterizer's data contract: non-horizontal edges span at most 180°
+///   of longitude — the source must already be split at the antimeridian
+///   (Natural Earth is). Horizontal wide edges are exempt (Antarctica's
+///   pole closure at lat -90 can never cross a scanline row).
+fn push_rings(
+    coords: Option<&serde_json::Value>,
+    out: &mut Vec<Vec<(f64, f64)>>,
+) -> Result<(), String> {
     let Some(rings) = coords.and_then(|c| c.as_array()) else {
-        return;
+        return Ok(());
     };
-    for ring in rings {
-        let Some(points) = ring.as_array() else {
-            continue;
-        };
-        let parsed: Vec<(f64, f64)> = points
-            .iter()
-            .filter_map(|p| {
-                let arr = p.as_array()?;
-                let lon = arr.first()?.as_f64()?;
-                let lat = arr.get(1)?.as_f64()?;
-                Some((lat, lon))
-            })
-            .collect();
-        if !parsed.is_empty() {
-            out.push(parsed);
+    for (ri, ring) in rings.iter().enumerate() {
+        let points = ring
+            .as_array()
+            .ok_or_else(|| format!("ring {ri}: coordinates must be an array"))?;
+        let mut parsed: Vec<(f64, f64)> = Vec::with_capacity(points.len());
+        for (pi, p) in points.iter().enumerate() {
+            let arr = p
+                .as_array()
+                .ok_or_else(|| format!("ring {ri} point {pi}: expected a [lon, lat] array"))?;
+            let lon = arr
+                .first()
+                .and_then(|v| v.as_f64())
+                .ok_or_else(|| format!("ring {ri} point {pi}: longitude must be a number"))?;
+            let lat = arr
+                .get(1)
+                .and_then(|v| v.as_f64())
+                .ok_or_else(|| format!("ring {ri} point {pi}: latitude must be a number"))?;
+            if !(-90.0..=90.0).contains(&lat) {
+                return Err(format!(
+                    "ring {ri} point {pi}: latitude {lat} outside [-90, 90]"
+                ));
+            }
+            if !(-180.0..=180.0).contains(&lon) {
+                return Err(format!(
+                    "ring {ri} point {pi}: longitude {lon} outside [-180, 180] \
+                     (is the source split/normalized at the antimeridian?)"
+                ));
+            }
+            parsed.push((lat, lon));
         }
+        if parsed.len() < 3 {
+            return Err(format!(
+                "ring {ri}: only {} vertices (< 3) — degenerate ring",
+                parsed.len()
+            ));
+        }
+        let n = parsed.len();
+        for i in 0..n {
+            let (a, b) = (parsed[i], parsed[(i + 1) % n]);
+            let horizontal = (a.0 - b.0).abs() < 1e-9;
+            let dlon = (a.1 - b.1).abs();
+            if !horizontal && dlon > 180.0 {
+                return Err(format!(
+                    "ring {ri}: edge spans {dlon:.2} deg of longitude (lat {} -> {}) \
+                     — source is not split at the antimeridian; the rasterizer would \
+                     silently mis-render it. Split the ring at ±180 first.",
+                    a.0, b.0
+                ));
+            }
+        }
+        out.push(parsed);
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------

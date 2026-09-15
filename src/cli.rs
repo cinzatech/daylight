@@ -8,11 +8,17 @@ use clap::{Parser, ValueEnum};
 #[derive(Parser, Debug)]
 #[command(name = "daylight", version, about, long_about = None, after_help = INTERACTIVE_HELP)]
 pub struct Args {
-    /// Central meridian, degrees east [-180..180].
+    /// Central meridian, degrees east [-180..180]. Takes precedence over
+    /// `--utc` for the map meridian (the clock stays UTC).
     ///
     /// Default: 15° × UTC offset of the local timezone captured at startup,
     /// so your longitude sits near the map center.
-    #[arg(long, value_name = "DEG", value_parser = parse_center)]
+    #[arg(
+        long,
+        value_name = "DEG",
+        value_parser = parse_center,
+        allow_negative_numbers = true
+    )]
     pub center: Option<f64>,
 
     /// Clock in UTC; central meridian 0°.
@@ -31,8 +37,13 @@ pub struct Args {
     #[arg(long)]
     pub no_rotate: bool,
 
-    /// Redraw interval in milliseconds while rotating [default: 100].
-    #[arg(long = "interval", value_name = "MS", default_value_t = 100)]
+    /// Redraw interval in milliseconds while rotating [10..1000].
+    #[arg(
+        long = "interval",
+        value_name = "MS",
+        default_value_t = 100,
+        value_parser = parse_interval
+    )]
     pub interval_ms: u64,
 
     /// Render without braille ('#' land, '.' terminator) for limited fonts.
@@ -48,7 +59,7 @@ pub struct Args {
     pub once: bool,
 }
 
-const INTERACTIVE_HELP: &str = "Interactive keys:\n  q, Esc, Ctrl-C    quit (Ctrl-C exits 130)\n  Ctrl-Z            suspend (restore on resume)\n  u                 toggle UTC/local clock\n  c                 re-center map to current timezone\n  t                 toggle twilight curve\n  o                 toggle map-oval outline\n  a                 toggle slow rotation\n  r                 force repaint\n\nThe clock runs in the timezone current at startup (or UTC with --utc); only the\nmap center is pinned at startup — press c to re-center live.";
+const INTERACTIVE_HELP: &str = "Interactive keys (letter keys are case-insensitive):\n  q, Esc, Ctrl-C    quit (Ctrl-C exits 130)\n  Ctrl-Z            suspend (restore on resume)\n  u                 toggle UTC/local clock\n  c                 re-center map to current timezone\n  t                 toggle twilight curve\n  o                 toggle map-oval outline\n  a                 toggle slow rotation\n  r                 force repaint\n\nThe clock runs in the timezone current at startup (or UTC with --utc); only the\nmap center is pinned at startup — press c to re-center live.";
 
 fn parse_center(s: &str) -> Result<f64, String> {
     let v: f64 = s.parse().map_err(|_| format!("invalid number: {s}"))?;
@@ -56,6 +67,15 @@ fn parse_center(s: &str) -> Result<f64, String> {
         Ok(v)
     } else {
         Err("must be within [-180, 180]".to_string())
+    }
+}
+
+fn parse_interval(s: &str) -> Result<u64, String> {
+    let v: u64 = s.parse().map_err(|_| format!("invalid number: {s}"))?;
+    if (10..=1000).contains(&v) {
+        Ok(v)
+    } else {
+        Err("must be within [10, 1000] milliseconds".to_string())
     }
 }
 
@@ -89,13 +109,15 @@ pub struct Config {
 }
 
 impl ColorWhen {
-    /// Resolve `auto` against the environment: NO_COLOR and TERM=dumb disable color.
+    /// Resolve `auto` against the environment. `NO_COLOR` disables color only
+    /// when set to a non-empty value (the no-color.org convention), as does
+    /// `TERM=dumb` or a missing `TERM`; otherwise color follows TTY-ness.
     pub fn resolve(self, stdout_is_tty: bool) -> bool {
         match self {
             ColorWhen::Always => true,
             ColorWhen::Never => false,
             ColorWhen::Auto => {
-                if std::env::var_os("NO_COLOR").is_some() {
+                if std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()) {
                     return false;
                 }
                 match std::env::var("TERM").as_deref() {
@@ -128,10 +150,33 @@ pub fn parse() -> Config {
 }
 
 /// Default central meridian from the local UTC offset captured at startup:
-/// clamped 15° × offset-hours (including fractional offsets, rounded to the
-/// nearest 15° step of the *rounded* offset).
+/// `15° × offset-hours` (fractional offsets kept: UTC+05:30 → 82.5°), clamped
+/// to [-180, 180].
 pub fn default_center_deg() -> f64 {
-    let offset = chrono::Local::now().offset().local_minus_utc();
-    let hours = (offset as f64) / 3600.0;
-    (15.0 * hours).clamp(-180.0, 180.0)
+    center_from_offset_secs(chrono::Local::now().offset().local_minus_utc())
+}
+
+/// Pure core of [`default_center_deg`]: `15° × offset-hours`, clamped.
+pub fn center_from_offset_secs(offset_secs: i32) -> f64 {
+    (15.0 * offset_secs as f64 / 3600.0).clamp(-180.0, 180.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::center_from_offset_secs;
+
+    #[test]
+    fn center_from_offset_examples() {
+        // Whole hours.
+        assert!((center_from_offset_secs(0) - 0.0).abs() < 1e-12);
+        assert!((center_from_offset_secs(2 * 3600) - 30.0).abs() < 1e-12);
+        assert!((center_from_offset_secs(-5 * 3600) - (-75.0)).abs() < 1e-12);
+        // Fractional offset kept as-is (India UTC+05:30).
+        assert!((center_from_offset_secs(5 * 3600 + 1800) - 82.5).abs() < 1e-12);
+        // Nepal UTC+05:45.
+        assert!((center_from_offset_secs(5 * 3600 + 2700) - 86.25).abs() < 1e-12);
+        // Clamp at the dateline (UTC+14 → 210° → 180°).
+        assert!((center_from_offset_secs(14 * 3600) - 180.0).abs() < 1e-12);
+        assert!((center_from_offset_secs(-12 * 3600) - (-180.0)).abs() < 1e-12);
+    }
 }

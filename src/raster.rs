@@ -1,4 +1,5 @@
-//! Dot canvas, braille packing, and geographic scanline land fill. See INTERFACES.md.
+//! Dot canvas, braille packing, and geographic scanline land fill (PLAN §8).
+//! The module docs below are the specification.
 //!
 //! The canvas is a bit-per-dot grid (`dy = 0` at the top = north, `dx` growing east).
 //! Each 2x4 block of dots packs into one Unicode braille character (U+2800..U+28FF).
@@ -93,8 +94,8 @@ impl Canvas {
     }
 }
 
-/// A polygon edge in rotated frame space: longitudes normalized to (-PI, PI],
-/// latitudes in radians.
+/// A polygon edge in raw source coordinates (latitudes and longitudes in
+/// radians, no rotation, no normalization).
 #[derive(Clone, Copy)]
 struct Edge {
     lat0: f64,
@@ -124,27 +125,60 @@ fn kav_x(lon_rel: f64, lat: f64) -> f64 {
 /// in radians, no rotation, no normalization).
 ///
 /// Data contract: rings are pre-split at the antimeridian, as Natural Earth
-/// provides them — every edge spans at most 180° of longitude, and rings that
-/// touch the dateline carry sliver edges along ±180° that close them properly
-/// in raw space. (The committed dataset has exactly one wider edge: Antarctica's
-/// pole closure at latitude −90, horizontal, which can never cross a scanline
-/// row and is therefore inert.) Working purely in raw space makes the fill's
+/// provides them — every non-horizontal edge spans at most 180° of longitude, and
+/// rings that touch the dateline carry sliver edges along ±180° that close them
+/// properly in raw space. (The committed dataset has exactly one wider edge:
+/// Antarctica's pole closure at latitude −90, horizontal, which can never cross a
+/// scanline row and is therefore exempt.) Violations abort with a clear message —
+/// silently mis-rendering an unsplit ring (interpolating through the wrong side
+/// of the globe) must never happen. Working purely in raw space makes the fill's
 /// semantics identical to a plain ray-cast point-in-polygon test on the source
 /// rings — verified against exactly such an oracle in the tests.
 fn build_edges(rings: &[coast::Ring], edges: &mut Vec<Edge>) {
+    const LON_SPAN_EPS: f64 = 1e-12;
     for ring in rings {
         if ring.len() < 2 {
             continue;
         }
         for i in 0..ring.len() {
             let (a, b) = (ring[i], ring[(i + 1) % ring.len()]);
-            edges.push(Edge {
+            let e = Edge {
                 lat0: a.0.to_radians(),
                 lon0: a.1.to_radians(),
                 lat1: b.0.to_radians(),
                 lon1: b.1.to_radians(),
-            });
+            };
+            let horizontal = (e.lat0 - e.lat1).abs() < LON_SPAN_EPS;
+            let dlon = (e.lon0 - e.lon1).abs();
+            assert!(
+                horizontal || dlon <= PI + LON_SPAN_EPS,
+                "raster data contract violated: non-horizontal edge spans {dlon} rad \
+                 (> 180°) — rings must be pre-split at the antimeridian \
+                 (lat {}° -> {}°, lon {}° -> {}°)",
+                a.0,
+                b.0,
+                a.1,
+                b.1
+            );
+            edges.push(e);
         }
+    }
+}
+
+/// Land edges precomputed from decoded rings: identical to what [`draw_land`]
+/// builds internally, hoisted out so callers on a per-frame path can build
+/// them once and reuse them across frames.
+pub struct LandEdges {
+    edges: Vec<Edge>,
+}
+
+impl LandEdges {
+    /// Convert rings to raw-coordinate edges (see [`build_edges`] for the
+    /// pre-split data contract, enforced here with a clear panic).
+    pub fn build(rings: &[coast::Ring]) -> Self {
+        let mut edges = Vec::new();
+        build_edges(rings, &mut edges);
+        LandEdges { edges }
     }
 }
 
@@ -167,18 +201,21 @@ fn fill_span(
     dy: usize,
 ) {
     let two_pi = 2.0 * PI;
-    let eps = 1e-9;
-    // Rotate into the frame's space as one continuous interval (width <= 2*PI).
+    let lon_eps = 1e-9; // radians: window-boundary seam tolerance
+                        // Whole-window detection: a piece covering (almost) all 2*PI fills the row.
+    let full_row_eps = 1e-6;
+    let dot_eps = 1e-9; // dot columns: inclusive span edges against fp noise
+                        // Rotate into the frame's space as one continuous interval (width <= 2*PI).
     let mut start = normalize_lon_r(a - lambda0);
     let end_rel = start + (b - a);
-    while start < end_rel - eps {
+    while start < end_rel - lon_eps {
         // Window containing `start`: [w*2PI - PI, w*2PI + PI).
         let w = ((start + PI) / two_pi).floor();
         let win_hi = (w + 1.0) * two_pi - PI;
         let e = end_rel.min(win_hi);
         let l0 = start - w * two_pi;
         let l1 = e - w * two_pi;
-        if l1 - l0 >= two_pi - 1e-6 {
+        if l1 - l0 >= two_pi - full_row_eps {
             // Whole world at this latitude: fill the row.
             for dx in 0..dw {
                 canvas.set_dot(dx, dy);
@@ -188,8 +225,8 @@ fn fill_span(
         let f0 = kav_x(l0, lat) * s + half_w - 0.5;
         let f1 = kav_x(l1, lat) * s + half_w - 0.5;
         let (f0, f1) = if f0 <= f1 { (f0, f1) } else { (f1, f0) };
-        let d0 = ((f0 - eps).ceil() as i64).max(0);
-        let d1 = ((f1 + eps).floor() as i64).min(dw as i64 - 1);
+        let d0 = ((f0 - dot_eps).ceil() as i64).max(0);
+        let d1 = ((f1 + dot_eps).floor() as i64).min(dw as i64 - 1);
         for dx in d0..=d1 {
             canvas.set_dot(dx as usize, dy);
         }
@@ -206,14 +243,23 @@ fn fill_span(
 /// everything and +180° east of everything, matching the dateline slivers.
 /// Spans are rotated to the central meridian only when projected onto the dot
 /// grid; a span wider than the map window wraps via [`fill_span`].
+///
+/// Convenience wrapper: builds the edge list from `rings` on every call. On a
+/// per-frame path prefer [`LandEdges::build`] once + [`draw_land_edges`].
+#[allow(dead_code)] // convenience API; production callers use LandEdges, tests use this
 pub fn draw_land(canvas: &mut Canvas, frame: &geo::MapFrame, rings: &[coast::Ring]) {
+    draw_land_edges(canvas, frame, &LandEdges::build(rings));
+}
+
+/// [`draw_land`] with a precomputed [`LandEdges`] edge list (see the module docs
+/// and [`build_edges`] for the pre-split data contract).
+pub fn draw_land_edges(canvas: &mut Canvas, frame: &geo::MapFrame, land: &LandEdges) {
     let (dw, dh) = (frame.dots_w, frame.dots_h);
     if dw == 0 || dh == 0 || frame.x_max <= frame.x_min || frame.y_max <= frame.y_min {
         return;
     }
 
-    let mut edges: Vec<Edge> = Vec::new();
-    build_edges(rings, &mut edges);
+    let edges = &land.edges;
     if edges.is_empty() {
         return;
     }
@@ -229,7 +275,7 @@ pub fn draw_land(canvas: &mut Canvas, frame: &geo::MapFrame, rings: &[coast::Rin
         let lat_t = lat + lat_eps;
 
         crossings.clear();
-        for e in &edges {
+        for e in edges {
             // Standard half-open ray-cast rule: count each edge once.
             if (e.lat0 <= lat_t && lat_t < e.lat1) || (e.lat1 <= lat_t && lat_t < e.lat0) {
                 let t = (lat_t - e.lat0) / (e.lat1 - e.lat0);
@@ -239,7 +285,7 @@ pub fn draw_land(canvas: &mut Canvas, frame: &geo::MapFrame, rings: &[coast::Rin
         if crossings.len() < 2 {
             continue;
         }
-        crossings.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+        crossings.sort_unstable_by(|a, b| a.total_cmp(b));
 
         for pair in crossings.chunks(2) {
             if let [c0, c1] = pair {
@@ -255,7 +301,7 @@ mod tests {
     use crate::coast;
     use std::f64::consts::PI;
 
-    /// Exact map-oval bbox (INTERFACES.md geo section): x in ±sqrt(3)·PI/2, y in ±PI/2.
+    /// Exact map-oval bbox (the oval's true extremum): x in ±sqrt(3)·PI/2, y in ±PI/2.
     pub(crate) fn test_frame(dw: usize, dh: usize, lambda0_deg: f64) -> geo::MapFrame {
         let x_half = PI * 3.0f64.sqrt() / 2.0;
         geo::MapFrame {
@@ -538,7 +584,8 @@ mod tests {
         assert!(!c1.dot_set(1, 1));
 
         // 200x60 dots (PLAN §14.1 size) with a couple of rings — must not panic
-        // and must fill something.
+        // and must fill something. (The third ring is a pre-split dateline pair
+        // shape, per the data contract.)
         let f2 = test_frame(200, 60, 30.0);
         let mut c2 = Canvas::new(200, 60);
         draw_land(
@@ -552,7 +599,7 @@ mod tests {
                     (-70.0, 179.0),
                     (-70.0, -179.0),
                 ]),
-                ring(&[(60.0, 150.0), (70.0, 170.0), (65.0, -170.0)]),
+                ring(&[(60.0, 150.0), (70.0, 170.0), (65.0, 160.0)]),
             ],
         );
         let any = (0..c2.dots_h).any(|dy| (0..c2.dots_w).any(|dx| c2.dot_set(dx, dy)));
@@ -563,6 +610,71 @@ mod tests {
             for cx in 0..c2.dots_w.div_ceil(2) {
                 let ch = c2.cell_char(cx, cy);
                 assert!(('\u{2800}'..='\u{28FF}').contains(&ch));
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "data contract violated")]
+    fn unsplit_dateline_ring_is_rejected() {
+        // A ring whose edge crosses the antimeridian unsplit (170°E -> 170°W)
+        // violates the data contract: the scanline would interpolate the
+        // crossing through the wrong side of the globe. Building the edges
+        // must abort loudly instead of silently mis-rendering.
+        let unsplit = ring(&[(65.0, 170.0), (66.0, -170.0), (60.0, -175.0)]);
+        let f = test_frame(240, 120, 0.0);
+        let mut c = Canvas::new(f.dots_w, f.dots_h);
+        draw_land(&mut c, &f, &[unsplit]);
+    }
+
+    #[test]
+    fn horizontal_wide_edges_are_exempt() {
+        // Antarctica-style pole closure: the only >180° edge is the horizontal
+        // (-90, 180) -> (-90, -180) run at the pole, which can never cross a
+        // scanline row — accepted by the contract check while every other edge
+        // respects the 180° span limit.
+        let closure = ring(&[
+            (-70.0, 180.0),
+            (-75.0, 120.0),
+            (-80.0, 60.0),
+            (-75.0, 0.0),
+            (-80.0, -60.0),
+            (-75.0, -120.0),
+            (-70.0, -180.0),
+            (-90.0, -180.0),
+            (-90.0, 180.0),
+        ]);
+        let f = test_frame(240, 120, 0.0);
+        let mut c = Canvas::new(f.dots_w, f.dots_h);
+        draw_land(&mut c, &f, &[closure]); // must not panic
+        assert_dot(&c, &f, 0.0, -85.0, true, "inside the polar cap");
+        assert_dot(&c, &f, 0.0, -65.0, false, "outside the polar cap");
+    }
+
+    #[test]
+    fn projection_math_matches_geo() {
+        // Registration invariant: raster's local copies of the projection math
+        // must agree with geo (the land layer and the shading/terminator layers
+        // only line up because both sides use identical formulas).
+        for l0_deg in [-170.0f64, -37.5, 0.0, 37.5, 179.9] {
+            let l0 = l0_deg.to_radians();
+            for lat_deg in [-85.0f64, -42.0, -0.3, 0.0, 33.0, 71.5] {
+                let lat = lat_deg.to_radians();
+                for lon_deg in [-179.0f64, -95.5, -0.2, 0.0, 90.0, 178.0] {
+                    let lon = lon_deg.to_radians();
+                    let (x_geo, _) = geo::forward(lon, lat, l0);
+                    let x_local = kav_x(normalize_lon_r(lon - l0), lat);
+                    assert!(
+                        (x_geo - x_local).abs() < 1e-12,
+                        "l0={l0_deg} lat={lat_deg} lon={lon_deg}"
+                    );
+                    let n_geo = geo::normalize_lon(lon + 7.0 * PI - l0);
+                    let n_local = normalize_lon_r(lon + 7.0 * PI - l0);
+                    assert!(
+                        (n_geo - n_local).abs() < 1e-12,
+                        "normalize l0={l0_deg} lon={lon_deg}"
+                    );
+                }
             }
         }
     }

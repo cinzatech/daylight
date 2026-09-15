@@ -17,16 +17,20 @@ static SUSPEND_FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
 static RESUME_FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
 
 fn install_signal_handlers() {
-    use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM, SIGTSTP};
+    use signal_hook::consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGTSTP};
     use signal_hook::flag::register;
     let _ = register(SIGINT, flag(&EXIT_SIGINT));
     let _ = register(SIGTERM, flag(&EXIT_SIGTERM));
     let _ = register(SIGHUP, flag(&EXIT_SIGHUP));
+    let _ = register(SIGQUIT, flag(&EXIT_SIGQUIT));
     let _ = register(SIGTSTP, flag(&SUSPEND_FLAG));
     let _ = register(signal_hook::consts::SIGCONT, flag(&RESUME_FLAG));
 }
 
-/// Consume the pending exit signal, if any. Returns the signal number.
+static EXIT_SIGQUIT: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+
+/// Consume the pending exit signal, if any. Returns the signal number
+/// (checked in INT > TERM > HUP > QUIT priority order).
 pub fn take_exit_signal() -> Option<i32> {
     if flag(&EXIT_SIGINT).swap(false, Ordering::SeqCst) {
         Some(signal_hook::consts::SIGINT)
@@ -34,6 +38,8 @@ pub fn take_exit_signal() -> Option<i32> {
         Some(signal_hook::consts::SIGTERM)
     } else if flag(&EXIT_SIGHUP).swap(false, Ordering::SeqCst) {
         Some(signal_hook::consts::SIGHUP)
+    } else if flag(&EXIT_SIGQUIT).swap(false, Ordering::SeqCst) {
+        Some(signal_hook::consts::SIGQUIT)
     } else {
         None
     }
@@ -119,11 +125,13 @@ pub fn install_panic_hook() {
     }));
 }
 
-/// Suspend: restore terminal, reset SIGTSTP to default, raise it.
+/// Suspend: restore terminal, then stop the process. signal-hook 0.4's
+/// `emulate_default_handler(SIGTSTP)` maps to `DefaultKind::Stop`, i.e. it
+/// raises SIGSTOP with the default disposition (job control behaves the same
+/// as a re-raised SIGTSTP).
 /// The caller must re-init (and force a full redraw) on SIGCONT.
 pub fn suspend(guard: &mut TermGuard) {
     guard.restore();
-    // Re-raise SIGTSTP with its default disposition so the shell stops us.
     let _ = signal_hook::low_level::emulate_default_handler(signal_hook::consts::SIGTSTP);
 }
 

@@ -1,10 +1,13 @@
-//! NOAA low-precision solar position. See INTERFACES.md and PLAN.md §6.2.
+//! NOAA low-precision solar position. See PLAN.md §6.2.
 //!
 //! Formulas follow the NOAA "General Solar Position Calculations"
 //! (gml.noaa.gov) low-precision Fourier series in the fractional year —
-//! amply accurate for a terminal daylight map across ~1950–2050.
+//! amply accurate for a terminal daylight map across ~1950–2050. Series
+//! accuracy: about ±0.5° in declination (the Spencer series' native 0.01
+//! *radian* error) and ≲1 min in the equation of time — both below one dot
+//! row / a couple of minutes of terminator motion at map resolutions.
 //!
-//! Units: **degrees** at this module's public boundary (per INTERFACES.md);
+//! Units: **degrees** at this module's public boundary;
 //! radians only inside trig calls. All functions are pure.
 //!
 //! Note on the subsolar longitude: the subsolar meridian is where local
@@ -39,13 +42,13 @@ fn utc_decimal_hours(t: DateTime<Utc>) -> f64 {
 }
 
 /// Fractional-year angle γ in radians:
-/// γ = 2π/N · (day_of_year − 1 + (UTC_hours − 12)/24), N = 366 in leap years,
-/// else 365.
+/// γ = 2π/365 · (day_of_year − 1 + (UTC_hours − 12)/24). The divisor is 365
+/// unconditionally, exactly as the NOAA series is calibrated: using 366 in
+/// leap years re-phases the series and measurably *worsens* the fit
+/// (≈0.5° vs ≈0.3° max declination error in leap years).
 fn fractional_year(t: DateTime<Utc>) -> f64 {
-    let y = t.year();
-    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
-    let n = if leap { 366.0 } else { 365.0 };
-    std::f64::consts::TAU / n * (t.ordinal() as f64 - 1.0 + (utc_decimal_hours(t) - 12.0) / 24.0)
+    std::f64::consts::TAU / 365.0
+        * (t.ordinal() as f64 - 1.0 + (utc_decimal_hours(t) - 12.0) / 24.0)
 }
 
 /// Normalize any longitude in degrees to (−180, 180].
@@ -117,16 +120,20 @@ pub fn shading(elev_deg: f64) -> Shading {
 /// Longitude pair (degrees east) where the Sun's elevation equals `alpha_deg`
 /// at latitude `lat_deg`: (subsolar_lon + H, subsolar_lon − H), each
 /// normalized to (−180, 180]. Returns `None` when the latitude lies in the
-/// polar day/night band for that elevation (|cos H| > 1, or the degenerate
-/// pole case where cos φ = 0).
+/// polar day/night band for that elevation (|cos H| > 1 beyond a 1e-12
+/// tolerance, so NaN and genuinely polar latitudes land here, while the
+/// exact tangent row — whose floating-point cos H can sit a few ulps outside
+/// [−1, 1] — is admitted and returns its merged branch pair). The degenerate
+/// pole case (cos φ = 0) also lands in `None`.
 pub fn curve_lons(lat_deg: f64, sun: &Sun, alpha_deg: f64) -> Option<(f64, f64)> {
+    const COS_H_TOL: f64 = 1e-12;
     let lat = lat_deg * DEG2RAD;
     let decl = sun.decl_deg * DEG2RAD;
     let cos_h = ((alpha_deg * DEG2RAD).sin() - lat.sin() * decl.sin()) / (lat.cos() * decl.cos());
-    if !(-1.0..=1.0).contains(&cos_h) {
+    if !(-1.0 - COS_H_TOL..=1.0 + COS_H_TOL).contains(&cos_h) {
         return None; // polar day or polar night at this latitude (NaN also lands here)
     }
-    let h = cos_h.acos() * RAD2DEG;
+    let h = cos_h.clamp(-1.0, 1.0).acos() * RAD2DEG;
     Some((
         normalize_lon_deg(sun.lon_deg + h),
         normalize_lon_deg(sun.lon_deg - h),
@@ -138,10 +145,18 @@ pub fn curve_lons(lat_deg: f64, sun: &Sun, alpha_deg: f64) -> Option<(f64, f64)>
 /// accumulation drift), push both branch points per latitude. Latitudes
 /// inside polar bands are skipped. Points come in per-latitude pairs
 /// (same lat, the two branch longitudes).
+///
+/// The curve's poleward tangent tips (where the two branches merge) generically
+/// fall *between* sampled rows — and near a tangent the curve closes like √ε,
+/// so the last sampled row leaves a visible longitude gap. Each valid tangent
+/// latitude is therefore also emitted as a merged pair (unless a sampled row
+/// already sits exactly on it).
 pub fn sample_curve(sun: &Sun, alpha_deg: f64, step_deg: f64) -> Vec<(f64, f64)> {
     let mut pts = Vec::new();
-    if step_deg <= 0.0 {
-        return pts;
+    // NaN must be rejected too (a bare `step_deg <= 0.0` test is false for NaN,
+    // which would loop forever below).
+    if step_deg.is_nan() || step_deg <= 0.0 {
+        return pts; // non-positive or NaN: degenerate, nothing to sample
     }
     let mut i: usize = 1;
     loop {
@@ -155,7 +170,36 @@ pub fn sample_curve(sun: &Sun, alpha_deg: f64, step_deg: f64) -> Vec<(f64, f64)>
         }
         i += 1;
     }
+    for tangent_lat in tangent_lats(sun, alpha_deg) {
+        // Skip tangents that a sampled row already covers exactly (its merged
+        // pair was pushed by the loop above).
+        let row = (tangent_lat + 90.0) / step_deg;
+        let on_sampled_row = row >= 1.0 && row.fract().abs() < 1e-9;
+        if !on_sampled_row {
+            if let Some((lon_a, lon_b)) = curve_lons(tangent_lat, sun, alpha_deg) {
+                pts.push((tangent_lat, lon_a));
+                pts.push((tangent_lat, lon_b));
+            }
+        }
+    }
     pts
+}
+
+/// Latitudes where the elevation == α curve turns around (cos H = ±1, the
+/// two branches merging): φ ∈ {δ + 90 − α, δ − 90 + α, 90 + α − δ, −90 − α − δ},
+/// kept inside the open interval (−90°, 90°) and deduplicated. At α = 0 this
+/// is the classic ±(90° − |δ|) pair; the poles themselves (δ = ±α degenerate
+/// case) are excluded.
+fn tangent_lats(sun: &Sun, alpha_deg: f64) -> Vec<f64> {
+    let d = sun.decl_deg;
+    let a = alpha_deg;
+    let mut out: Vec<f64> = Vec::new();
+    for t in [d + 90.0 - a, d - 90.0 + a, 90.0 + a - d, -90.0 - a - d] {
+        if t > -90.0 + 1e-9 && t < 90.0 - 1e-9 && !out.iter().any(|&e| (e - t).abs() < 1e-9) {
+            out.push(t);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -462,10 +506,14 @@ mod tests {
 
     #[test]
     fn sample_curve_equinox_spans_all_latitudes() {
-        // Near equinox there are no polar bands: every row −88..88 contributes.
+        // Near equinox there are no polar bands at row resolution: every row
+        // −88..88 contributes, plus the two tangent tips just beyond the rows
+        // (decl is small but nonzero at this instant, so the tangents lie in
+        // (±88, ±90) and are appended as merged pairs).
         let sun = subsolar(utc(2024, 3, 20, 12, 0, 0));
+        assert!(sun.decl_deg.abs() > 0.0 && sun.decl_deg.abs() < 2.0);
         let pts = sample_curve(&sun, 0.0, 2.0);
-        assert_eq!(pts.len(), 89 * 2, "expected every latitude row");
+        assert_eq!(pts.len(), 89 * 2 + 4, "every row plus the two tangent tips");
         for &(lat, lon) in &pts {
             assert!(
                 elevation_deg(lat, lon, &sun).abs() <= 0.5,
@@ -475,15 +523,71 @@ mod tests {
     }
 
     #[test]
+    fn curve_lons_exact_tangent_row_is_admitted() {
+        // At the tangent latitude cos H is analytically −1, but floating point
+        // evaluates it a few ulps outside [−1, 1] — the strict check used to
+        // return None there, dropping the row that closes the curve.
+        let sun = Sun {
+            decl_deg: 23.44,
+            lon_deg: 10.0,
+        };
+        let tangent = 90.0 - 23.44; // exactly 66.56°N
+        let (a, b) = curve_lons(tangent, &sun, 0.0)
+            .expect("exact tangent row must be admitted (within tolerance)");
+        // Both branches merge on the antisolar meridian: 10° + 180° = −170°.
+        assert!((a + 170.0).abs() <= 1e-6, "east branch {a}");
+        assert!((b + 170.0).abs() <= 1e-6, "west branch {b}");
+        // Genuinely polar latitudes stay rejected.
+        assert!(curve_lons(tangent + 1.0, &sun, 0.0).is_none());
+    }
+
+    #[test]
+    fn sample_curve_emits_tangent_tips() {
+        // The poleward tips of the curve (where its branches merge) generically
+        // fall between sampled rows; the sampler must emit them so the curve
+        // closes instead of ending in a longitude gap.
+        let sun = subsolar(june_solstice()); // decl ≈ +23.4x°
+        let pts = sample_curve(&sun, 0.0, 2.0);
+        let mut merged = 0;
+        for ch in pts.chunks(2) {
+            let (lat, lon_a) = ch[0];
+            let lon_b = ch[1].1;
+            if (lon_a - lon_b).abs() < 1e-6 {
+                merged += 1;
+                // The tip sits on the curve (elevation ≈ 0) at the tangent band.
+                let e = elevation_deg(lat, lon_a, &sun);
+                assert!(e.abs() <= 0.5, "tangent tip ({lat},{lon_a}) elev {e}");
+            }
+        }
+        assert!(merged >= 2, "expected both poleward tips, found {merged}");
+    }
+
+    #[test]
     fn sample_curve_degenerate_steps() {
         let sun = subsolar(june_solstice());
         assert!(sample_curve(&sun, 0.0, 0.0).is_empty());
         assert!(sample_curve(&sun, 0.0, -2.0).is_empty());
-        // Step of 90°: only the equator row, its two branches.
+        assert!(
+            sample_curve(&sun, 0.0, f64::NAN).is_empty(),
+            "NaN step must not loop"
+        );
+        // Step of 90°: the equator row's two branches plus the two tangent tips.
         let pts = sample_curve(&sun, 0.0, 90.0);
-        assert_eq!(pts.len(), 2);
+        assert_eq!(pts.len(), 6, "equator pair + 2 merged tangent pairs");
         let (lat, lon) = pts[0];
         assert_eq!(lat, 0.0);
         assert!(elevation_deg(lat, lon, &sun).abs() <= 0.5);
+        // The appended tangent pairs share a latitude and a longitude.
+        let (t_lat, t_a) = pts[4];
+        let (t_lat2, t_b) = pts[5];
+        assert_eq!(t_lat, t_lat2);
+        assert!(
+            (t_a - t_b).abs() < 1e-6,
+            "tangent branches merge: {t_a} vs {t_b}"
+        );
+        assert!(
+            t_lat > 60.0,
+            "June tangent is in the far north, got {t_lat}"
+        );
     }
 }

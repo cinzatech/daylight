@@ -1,4 +1,4 @@
-//! Frame composition and ANSI/plain writers. See INTERFACES.md (frame section).
+//! Frame composition and ANSI/plain writers.
 //!
 //! Screen layout for a terminal of `w` x `h` cells:
 //!
@@ -15,8 +15,8 @@
 //! crossing a continent shows both. Cells whose center dot falls outside the map
 //! oval stay `Cell::BLANK`.
 //!
-//! Cross-module conventions relied on (per INTERFACES.md and the implemented
-//! geo module):
+//! Cross-module conventions relied on (documented in the respective modules
+//! and verified by tests):
 //! - `geo::MapFrame::dot_to_lonlat` returns `(lon, lat)` in **radians** (the
 //!   geo module is radians throughout); `lonlat_to_dot` takes degrees.
 //! - `solar::sample_curve` yields `(lat_deg, lon_deg)` pairs (documented order).
@@ -94,7 +94,17 @@ pub struct RenderParams<'a> {
 
 /// Compose a full frame: map area (rows 0..=h-3) plus the centered clock line
 /// (row h-1). Pure: same params in, same frame out.
+///
+/// Convenience wrapper: builds the land edges from `p.rings` on every call
+/// (tests, one-shot). Interactive callers on the 100 ms rotation cadence should
+/// precompute with [`raster::LandEdges::build`] and call [`compose_with`].
 pub fn compose(p: &RenderParams) -> Frame {
+    compose_with(p, &raster::LandEdges::build(p.rings))
+}
+
+/// [`compose`] with a precomputed land-edge list (`p.rings` is unused here; the
+/// edges must correspond to it).
+pub fn compose_with(p: &RenderParams, land_edges: &raster::LandEdges) -> Frame {
     let mut frame = Frame::new(p.w, p.h, Cell::BLANK);
 
     compose_clock_row(&mut frame, &p.clock_line);
@@ -111,7 +121,7 @@ pub fn compose(p: &RenderParams) -> Frame {
 
     // Layer 1: land fill (static per size + central meridian).
     let mut land = raster::Canvas::new(dots_w, dots_h);
-    raster::draw_land(&mut land, &mf, p.rings);
+    raster::draw_land_edges(&mut land, &mf, land_edges);
 
     // Layer 2: terminator curve (elevation 0); Layer 3: civil twilight (-6 deg).
     let mut terminator = raster::Canvas::new(dots_w, dots_h);
@@ -135,8 +145,19 @@ pub fn compose(p: &RenderParams) -> Frame {
     // inside with at least one 4-neighbor outside (or off the grid) is on the rim.
     // The rim is OR-ed into the land layer, so it renders in the terrain color
     // (land style of the cell's own shading).
+    //
+    // Membership is computed once per dot here (it depends only on the dot grid,
+    // not on the sun or the central meridian) and reused for the rim/neighbor
+    // checks below — that is ~5x fewer dot_to_lonlat calls than testing each
+    // dot and each of its 4 neighbors independently.
+    let mut inside_grid = vec![false; dots_w * dots_h];
+    for dy in 0..dots_h {
+        for dx in 0..dots_w {
+            inside_grid[dy * dots_w + dx] = mf.dot_to_lonlat(dx, dy).is_some();
+        }
+    }
     let inside = |dx: usize, dy: usize| -> bool {
-        dx < dots_w && dy < dots_h && mf.dot_to_lonlat(dx, dy).is_some()
+        dx < dots_w && dy < dots_h && inside_grid[dy * dots_w + dx]
     };
     const CELL_BITS: [[u8; 4]; 2] = [[0x01, 0x02, 0x04, 0x40], [0x08, 0x10, 0x20, 0x80]];
     let mut oval_masks: Vec<u8> = vec![0u8; map_cols * map_rows];
@@ -306,33 +327,26 @@ fn land_style(shading: Shading) -> Style {
 enum ColorMode {
     /// Bold/dim attributes only; never a color SGR (color=false terminals).
     Mono,
-    /// Full 256-color theme.
+    /// Full 16-standard-color theme (30–37, 90–97).
     Full,
 }
 
 /// Style -> SGR parameter string (without the `ESC[` / `m` wrapper).
 ///
-/// Palette constants (256-color indexes, picked for tasteful contrast):
+/// Palette (only the 16 standard ANSI colors, so the user's terminal color
+/// theme supplies the actual hues on every computer):
 /// - DaySea    : default foreground (plain reset)
-/// - DayLand   : bold, fg 114 (soft green) — daylight land stands out
-/// - TwiSea    : fg 244 (mid gray)
-/// - TwiLand   : fg 246 (lighter gray; no bold/dim — the twilight middle ground)
-/// - DaySea   : default (theme background/foreground)
-/// - DayLand  : bold, standard green
-/// - TwiSea   : bright black (theme gray)
-/// - TwiLand  : bold bright black
-/// - NightSea : dim bright black
-/// - NightLand: dim white
+/// - DayLand   : bold, standard green
+/// - TwiSea    : bright black (theme gray)
+/// - TwiLand   : bold bright black
+/// - NightSea  : dim bright black
+/// - NightLand : dim white
 /// - Terminator: bold, standard yellow
 /// - Clock     : bold
 ///
-/// Only the 16 standard ANSI colors are used, so the user's terminal color
-/// theme supplies the actual hues on every computer.
 /// In `Mono` mode only bold/dim survive (bold for day land / terminator / clock,
 /// dim for night), so shading stays readable without any color support.
 fn style_params(style: Style, mode: ColorMode) -> &'static str {
-    // Only the 16 standard ANSI colors (30–37, 90–97) are used, so the user's
-    // terminal theme supplies the actual hues on every computer.
     match (style, mode) {
         (Style::Blank, _) | (Style::DaySea, _) => "0",
         (Style::DayLand, ColorMode::Mono) => "1",

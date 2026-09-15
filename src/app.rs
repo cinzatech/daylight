@@ -1,13 +1,16 @@
 //! Application state, run modes, and the event loop.
 //!
-//! Event-driven, no busy loops: while idle the process is blocked in
-//! `crossterm::event::poll` (or a sleep to the next second when there is no
-//! usable terminal input). Frames are only rebuilt when the minute (shading)
-//! or second (clock) changes, or on resize / interactive toggles.
+//! Event-driven, no busy loops: with rotation off the process is blocked in
+//! `crossterm::event::poll` (waking once per second for the clock); with slow
+//! rotation on (the default) it wakes every `--interval` ms to advance the
+//! map, recomposing the frame at each tick (the land edges are precomputed
+//! once at startup; only shading/terminator/clock genuinely change). Frames
+//! are diffed — only changed cells reach the terminal.
 
 use crate::cli::{default_center_deg, Config};
 use crate::coast;
 use crate::frame::{self, Frame, RenderParams};
+use crate::raster;
 use crate::solar;
 use crate::term::{self, TermGuard};
 use chrono::{FixedOffset, Local, Utc};
@@ -24,7 +27,7 @@ pub fn run(cfg: &Config) -> i32 {
     run_interactive(cfg, color, &rings)
 }
 
-/// One-shot render to stdout; exit 0.
+/// One-shot render to stdout; exit 0 (1 on write failure, e.g. EPIPE).
 fn run_once(cfg: &Config, color: bool, rings: &[coast::Ring]) -> i32 {
     let (w, h) = term::size();
     let now = Utc::now();
@@ -44,8 +47,14 @@ fn run_once(cfg: &Config, color: bool, rings: &[coast::Ring]) -> i32 {
     });
     let bytes = frame::render_plain(&f, color);
     let mut out = std::io::stdout().lock();
-    let _ = out.write_all(&bytes);
-    let _ = out.flush();
+    if let Err(e) = out.write_all(&bytes) {
+        eprintln!("daylight: write error: {e}");
+        return 1;
+    }
+    if let Err(e) = out.flush() {
+        eprintln!("daylight: write error: {e}");
+        return 1;
+    }
     0
 }
 
@@ -75,11 +84,12 @@ struct App {
     twilight: bool,
     outline: bool,
     rotate: bool,
-    /// Redraw interval in ms while rotating (from --interval).
+    /// Redraw interval in ms while rotating (from --interval; validated to [10, 1000]).
     interval_ms: u64,
     ascii: bool,
     color: bool,
-    rings: Vec<coast::Ring>,
+    /// Land edges precomputed once — rings never change at runtime.
+    land_edges: raster::LandEdges,
     size: (u16, u16),
     prev: Option<Frame>,
     last_minute: Option<i64>,
@@ -104,32 +114,38 @@ fn advance_center(current: f64, deg_per_sec: f64, dt_secs: f64) -> f64 {
 
 impl App {
     /// Rebuild the frame and emit a diff (or full frame when forced/first).
-    fn redraw(&mut self, now: chrono::DateTime<Utc>, full: bool) {
+    /// Returns false when writing to stdout fails (caller should give up).
+    fn redraw(&mut self, now: chrono::DateTime<Utc>, full: bool) -> bool {
         let sun = solar::subsolar(now);
         let clock = if self.use_utc {
             now.with_timezone(&FixedOffset::east_opt(0).unwrap())
         } else {
             now.with_timezone(&Local).fixed_offset()
         };
-        let f = frame::compose(&RenderParams {
-            w: self.size.0 as usize,
-            h: self.size.1 as usize,
-            lambda0_deg: self.lambda0_deg,
-            rings: &self.rings,
-            sun,
-            draw_twilight_curve: self.twilight,
-            draw_oval_outline: self.outline,
-            ascii: self.ascii,
-            clock_line: frame::clock_line(clock, &sun),
-        });
+        let f = frame::compose_with(
+            &RenderParams {
+                w: self.size.0 as usize,
+                h: self.size.1 as usize,
+                lambda0_deg: self.lambda0_deg,
+                rings: &[],
+                sun,
+                draw_twilight_curve: self.twilight,
+                draw_oval_outline: self.outline,
+                ascii: self.ascii,
+                clock_line: frame::clock_line(clock, &sun),
+            },
+            &self.land_edges,
+        );
         let prev = if full { None } else { self.prev.as_ref() };
         let bytes = frame::render_ansi(prev, &f, self.color);
         if !bytes.is_empty() {
             let mut out = std::io::stdout().lock();
-            let _ = out.write_all(&bytes);
-            let _ = out.flush();
+            if out.write_all(&bytes).is_err() || out.flush().is_err() {
+                return false;
+            }
         }
         self.prev = Some(f);
+        true
     }
 
     fn handle_key(
@@ -201,7 +217,7 @@ fn run_interactive(cfg: &Config, color: bool, rings: &[coast::Ring]) -> i32 {
         interval_ms: cfg.interval_ms,
         ascii: cfg.ascii,
         color,
-        rings: rings.to_vec(),
+        land_edges: raster::LandEdges::build(rings),
         size: term::size(),
         prev: None,
         last_minute: None,
@@ -235,7 +251,11 @@ fn run_interactive(cfg: &Config, color: bool, rings: &[coast::Ring]) -> i32 {
         if app.prev.is_none() || rotated || minute_changed || second_changed {
             // First frame or resize => full repaint; shading recompute on minute change.
             let full = app.prev.is_none();
-            app.redraw(now, full);
+            if !app.redraw(now, full) {
+                guard.restore();
+                eprintln!("daylight: write error");
+                return 1;
+            }
             app.last_minute = Some(minute_key);
             app.last_second = Some(second_key);
         }
@@ -249,8 +269,8 @@ fn run_interactive(cfg: &Config, color: bool, rings: &[coast::Ring]) -> i32 {
         } else {
             std::time::Duration::from_millis(1000 - now.timestamp_subsec_millis() as u64)
         };
-        if crossterm::event::poll(timeout).unwrap_or(false) {
-            match crossterm::event::read() {
+        match crossterm::event::poll(timeout) {
+            Ok(true) => match crossterm::event::read() {
                 Ok(crossterm::event::Event::Key(k)) => {
                     if k.kind == crossterm::event::KeyEventKind::Press {
                         if let Some(ctl) = app.handle_key(k.code, k.modifiers) {
@@ -263,10 +283,15 @@ fn run_interactive(cfg: &Config, color: bool, rings: &[coast::Ring]) -> i32 {
                                     term::suspend(&mut guard);
                                     // Blocked in the kernel until SIGCONT.
                                     term::resume(&mut guard);
+                                    app.size = term::size(); // may have changed while stopped
                                     app.prev = None;
                                 }
                                 LoopCtl::Dirty => {
-                                    app.redraw(Utc::now(), false);
+                                    if !app.redraw(Utc::now(), false) {
+                                        guard.restore();
+                                        eprintln!("daylight: write error");
+                                        return 1;
+                                    }
                                 }
                                 LoopCtl::DirtyFull => {
                                     app.prev = None;
@@ -280,6 +305,13 @@ fn run_interactive(cfg: &Config, color: bool, rings: &[coast::Ring]) -> i32 {
                     app.prev = None;
                 }
                 _ => {}
+            },
+            Ok(false) => {}
+            Err(_) => {
+                // Persistent event-source failure: sleep a bounded slice of the
+                // intended timeout instead of spinning (the naive
+                // `unwrap_or(false)` would turn an error into a busy loop).
+                std::thread::sleep(timeout.min(std::time::Duration::from_millis(50)));
             }
         }
 
@@ -291,6 +323,7 @@ fn run_interactive(cfg: &Config, color: bool, rings: &[coast::Ring]) -> i32 {
         if term::take_suspend_request() {
             term::suspend(&mut guard);
             term::resume(&mut guard);
+            app.size = term::size(); // may have changed while stopped
             app.prev = None;
         }
         if term::take_resume_request() {

@@ -1,8 +1,6 @@
 //! Land polygon decoder for the embedded Natural Earth 110m coastline data
-//! (see PLAN.md §7 and INTERFACES.md, "coast" section).
-//!
-//! The encoder lives in `examples/datagen.rs`; this module documents the wire format
-//! and implements the exact inverse decoder.
+//! (see PLAN.md §7). This module's docs below are the wire-format
+//! specification; the encoder lives in `examples/datagen.rs`.
 //!
 //! # Wire format
 //!
@@ -64,10 +62,14 @@ pub fn decode(data: &str) -> Vec<Ring> {
     let bytes = base85_decode(data);
     let mut pos = 0usize;
     let ring_count = read_varint(&bytes, &mut pos);
-    let mut rings = Vec::with_capacity(ring_count.min(1 << 16) as usize);
+    // Each ring costs at least one byte (its vertex-count varint), so the
+    // remaining stream length is a tight cap against a corrupt header.
+    let mut rings = Vec::with_capacity(ring_count.min((bytes.len() - pos) as u64) as usize);
     for _ in 0..ring_count {
         let vertex_count = read_varint(&bytes, &mut pos);
-        let mut ring = Vec::with_capacity(vertex_count.min(1 << 24) as usize);
+        // Each vertex costs at least two bytes (two varints).
+        let remaining = (bytes.len() - pos) as u64;
+        let mut ring = Vec::with_capacity(vertex_count.min(remaining / 2) as usize);
         let (mut lat_c, mut lon_c): (i64, i64) = (0, 0);
         for _ in 0..vertex_count {
             lat_c += zigzag_decode(read_varint(&bytes, &mut pos));
@@ -123,6 +125,8 @@ fn base85_decode(data: &str) -> Vec<u8> {
 }
 
 /// Read one little-endian 7-bit-group varint starting at `*pos`, advancing it.
+/// A 10th byte may only carry a single payload bit (shift 63), so higher bits
+/// would be silently shifted out — rejected instead of truncated.
 fn read_varint(bytes: &[u8], pos: &mut usize) -> u64 {
     let mut value: u64 = 0;
     for shift in (0..64).step_by(7) {
@@ -131,6 +135,12 @@ fn read_varint(bytes: &[u8], pos: &mut usize) -> u64 {
             .copied()
             .expect("truncated coast varint stream");
         *pos += 1;
+        if shift == 63 {
+            assert!(
+                b & 0x7f <= 1,
+                "coast varint payload overflows 64 bits (byte {b:#04x} at shift 63)"
+            );
+        }
         value |= ((b & 0x7f) as u64) << shift;
         if b & 0x80 == 0 {
             return value;
@@ -147,6 +157,7 @@ fn zigzag_decode(v: u64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::coast_data::LAND_DATA;
 
     // ---------------------------------------------------------------------
     // Test-side encoder (inverse of `decode`; mirrors examples/datagen.rs).
@@ -345,6 +356,4 @@ mod tests {
         });
         assert!(hit, "no decoded ring bbox contains the Rome probe point");
     }
-
-    use crate::coast_data::LAND_DATA;
 }
