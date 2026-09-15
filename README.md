@@ -85,6 +85,8 @@ daylight --once > map.txt # one static frame (also automatic when piping)
   press `c` to re-center live. By default the map slowly rotates eastward
   (one full turn in ~6 minutes; `--no-rotate` or `a` to stop).
 - Honors `NO_COLOR` and `TERM=dumb`; degrades to dim/bold attributes without color.
+  Color output uses only the 16 standard ANSI colors, so your terminal theme's
+  palette is respected on every computer.
 - Well-mannered terminal citizen: alternate screen, symmetric raw-mode
   setup/teardown (also on panics and signals), no bell, no mouse capture, scrollback
   untouched. Exit codes: 0 clean, 2 usage error, 1 runtime error, 130/143/129 for

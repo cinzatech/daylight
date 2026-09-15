@@ -317,28 +317,36 @@ enum ColorMode {
 /// - DayLand   : bold, fg 114 (soft green) — daylight land stands out
 /// - TwiSea    : fg 244 (mid gray)
 /// - TwiLand   : fg 246 (lighter gray; no bold/dim — the twilight middle ground)
-/// - NightSea  : dim, fg 238 (dark gray)
-/// - NightLand : dim, fg 244
-/// - Terminator: bold, fg 214 (orange accent)
+/// - DaySea   : default (theme background/foreground)
+/// - DayLand  : bold, standard green
+/// - TwiSea   : bright black (theme gray)
+/// - TwiLand  : bold bright black
+/// - NightSea : dim bright black
+/// - NightLand: dim white
+/// - Terminator: bold, standard yellow
 /// - Clock     : bold
 ///
+/// Only the 16 standard ANSI colors are used, so the user's terminal color
+/// theme supplies the actual hues on every computer.
 /// In `Mono` mode only bold/dim survive (bold for day land / terminator / clock,
 /// dim for night), so shading stays readable without any color support.
 fn style_params(style: Style, mode: ColorMode) -> &'static str {
+    // Only the 16 standard ANSI colors (30–37, 90–97) are used, so the user's
+    // terminal theme supplies the actual hues on every computer.
     match (style, mode) {
         (Style::Blank, _) | (Style::DaySea, _) => "0",
         (Style::DayLand, ColorMode::Mono) => "1",
-        (Style::DayLand, ColorMode::Full) => "1;38;5;114",
+        (Style::DayLand, ColorMode::Full) => "1;32",
         (Style::TwiSea, ColorMode::Mono) => "0",
-        (Style::TwiSea, ColorMode::Full) => "38;5;244",
+        (Style::TwiSea, ColorMode::Full) => "90",
         (Style::TwiLand, ColorMode::Mono) => "0",
-        (Style::TwiLand, ColorMode::Full) => "38;5;246",
+        (Style::TwiLand, ColorMode::Full) => "1;90",
         (Style::NightSea, ColorMode::Mono) => "2",
-        (Style::NightSea, ColorMode::Full) => "2;38;5;238",
+        (Style::NightSea, ColorMode::Full) => "2;90",
         (Style::NightLand, ColorMode::Mono) => "2",
-        (Style::NightLand, ColorMode::Full) => "2;38;5;244",
+        (Style::NightLand, ColorMode::Full) => "2;37",
         (Style::Terminator, ColorMode::Mono) => "1",
-        (Style::Terminator, ColorMode::Full) => "1;38;5;214",
+        (Style::Terminator, ColorMode::Full) => "1;33",
         (Style::Clock, _) => "1",
     }
 }
@@ -352,7 +360,7 @@ fn push_sgr(out: &mut Vec<u8>, params: &str) {
 /// Append one cell, emitting an SGR only when the style's SGR parameters change
 /// relative to `cur` (None == terminal is in the reset state). Every emitted SGR is
 /// **self-contained**: `ESC[0;{params}m` (or a bare reset) rather than a delta.
-/// SGR attributes are sticky — a bare `ESC[1m` or `ESC[38;5;Nm` after a
+/// SGR attributes are sticky — a bare `ESC[1m` or `ESC[32m` after a
 /// `dim`+color style would leave dim (or the old color) active — so transitions
 /// must always begin from a known reset state. `mode == None` means "never emit
 /// SGR" (plain-text output).
@@ -1195,6 +1203,7 @@ mod tests {
                         self.attrs.dim = false;
                     }
                     39 => self.attrs.fg = None,
+                    p @ 30..=37 | p @ 90..=97 => self.attrs.fg = Some(p as u8),
                     38 => {
                         assert!(params[i + 1] == 5, "only 256-color SGR expected");
                         self.attrs.fg = Some(params[i + 2] as u8);
@@ -1218,15 +1227,15 @@ mod tests {
             let params = match (style, mode) {
                 (Style::Blank, _) | (Style::DaySea, _) => "0",
                 (Style::DayLand, "mono") => "1",
-                (Style::DayLand, _) => "1;38;5;114",
+                (Style::DayLand, _) => "1;32",
                 (Style::TwiSea, "mono") | (Style::TwiLand, "mono") => "0",
-                (Style::TwiSea, _) => "38;5;244",
-                (Style::TwiLand, _) => "38;5;246",
+                (Style::TwiSea, _) => "90",
+                (Style::TwiLand, _) => "1;90",
                 (Style::NightSea, "mono") | (Style::NightLand, "mono") => "2",
-                (Style::NightSea, _) => "2;38;5;238",
-                (Style::NightLand, _) => "2;38;5;244",
+                (Style::NightSea, _) => "2;90",
+                (Style::NightLand, _) => "2;37",
                 (Style::Terminator, "mono") => "1",
-                (Style::Terminator, _) => "1;38;5;214",
+                (Style::Terminator, _) => "1;33",
                 (Style::Clock, _) => "1",
             };
             let full = if params == "0" {
@@ -1338,7 +1347,7 @@ mod tests {
             "clock must render plain bold, not the night run's dim/color"
         );
         let twi = term.screen[0][1].1.clone();
-        assert_eq!(twi.fg, Some(246), "twilight land keeps its color");
+        assert_eq!(twi.fg, Some(90), "twilight land keeps its color");
         assert!(!twi.dim, "night dim must not leak into twilight land");
     }
 
@@ -1433,7 +1442,7 @@ mod tests {
         let f = compose(&params(W, H, &rings, sun, false, true, "clock"));
         let out = render_plain(&f, true);
         let s = String::from_utf8(out).unwrap();
-        assert!(s.contains("38;5;214"), "terminator accent color expected");
+        assert!(s.contains("1;33"), "terminator accent color expected");
         assert!(
             s.contains("\x1b[0;1m"),
             "self-contained bold expected for day land / clock"
