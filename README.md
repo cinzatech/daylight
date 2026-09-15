@@ -101,3 +101,16 @@ cargo run --example datagen -- data/ne_110m_land.geojson
 ```
 
 See [PLAN.md](PLAN.md) for the full design and requirements. Linux/UNIX only.
+
+## License
+
+Copyright (C) 2026 Nirro
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option) any
+later version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. See the [LICENSE](LICENSE) file for the full license text.
