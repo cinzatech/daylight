@@ -127,16 +127,51 @@ pub fn compose(p: &RenderParams) -> Frame {
         }
     }
 
+    // Per-cell oval membership at dot granularity: which of the 2x4 braille dots of
+    // each cell lie inside the map oval. This keeps the map border on the dot grid
+    // (sub-cell detail) instead of stepping in whole cells. Same bit layout as
+    // raster's CELL_BITS (left column dots 1,2,3,7; right column dots 4,5,6,8).
+    const CELL_BITS: [[u8; 4]; 2] = [[0x01, 0x02, 0x04, 0x40], [0x08, 0x10, 0x20, 0x80]];
+    let mut oval_masks: Vec<u8> = vec![0u8; map_cols * map_rows];
+    let mut shade_dots: Vec<(usize, usize)> = vec![(0, 0); map_cols * map_rows];
     for cy in 0..map_rows {
         for cx in 0..map_cols {
-            // Geographic location of the cell: its center dot (right column, third
-            // row of the 2x4 dot block). Outside the map oval => stays BLANK.
-            // dot_to_lonlat speaks radians; solar speaks degrees.
-            let Some((lon_rad, lat_rad)) = mf.dot_to_lonlat(2 * cx + 1, 4 * cy + 2) else {
-                continue;
-            };
+            let mut mask = 0u8;
+            let mut shade: Option<(usize, usize)> = None;
+            for (col, bits_col) in CELL_BITS.iter().enumerate() {
+                for (row, bit) in bits_col.iter().enumerate() {
+                    let (dx, dy) = (2 * cx + col, 4 * cy + row);
+                    if mf.dot_to_lonlat(dx, dy).is_some() {
+                        mask |= bit;
+                        // Prefer the cell's center-ish dot (right column, third row)
+                        // for the shading sample; any inside dot as fallback.
+                        if shade.is_none() || (dx, dy) == (2 * cx + 1, 4 * cy + 2) {
+                            shade = Some((dx, dy));
+                        }
+                    }
+                }
+            }
+            let i = cy * map_cols + cx;
+            oval_masks[i] = mask;
+            shade_dots[i] = shade.unwrap_or((2 * cx + 1, 4 * cy + 2));
+        }
+    }
+
+    for cy in 0..map_rows {
+        for cx in 0..map_cols {
+            let i = cy * map_cols + cx;
+            let oval_mask = oval_masks[i];
+            if oval_mask == 0 {
+                continue; // entirely outside the map oval => stays BLANK
+            }
+            // Geographic location for shading. dot_to_lonlat speaks radians;
+            // solar speaks degrees.
+            let (lon_rad, lat_rad) = mf
+                .dot_to_lonlat(shade_dots[i].0, shade_dots[i].1)
+                .expect("shade dot was verified inside the oval");
             let (lon_deg, lat_deg) = (lon_rad.to_degrees(), lat_rad.to_degrees());
-            let land_mask = land.cell_mask(cx, cy);
+            // Land dots outside the oval (the scanline fills to the grid edge) drop.
+            let land_mask = land.cell_mask(cx, cy) & oval_mask;
             let curve_mask = terminator.cell_mask(cx, cy) | twilight.cell_mask(cx, cy);
             let shading = solar::shading(solar::elevation_deg(lat_deg, lon_deg, &p.sun));
             let cell = if p.ascii {
@@ -297,8 +332,12 @@ fn push_sgr(out: &mut Vec<u8>, params: &str) {
 }
 
 /// Append one cell, emitting an SGR only when the style's SGR parameters change
-/// relative to `cur` (None == terminal is in the reset state). `mode == None`
-/// means "never emit SGR" (plain-text output).
+/// relative to `cur` (None == terminal is in the reset state). Every emitted SGR is
+/// **self-contained**: `ESC[0;{params}m` (or a bare reset) rather than a delta.
+/// SGR attributes are sticky — a bare `ESC[1m` or `ESC[38;5;Nm` after a
+/// `dim`+color style would leave dim (or the old color) active — so transitions
+/// must always begin from a known reset state. `mode == None` means "never emit
+/// SGR" (plain-text output).
 fn push_cell(
     out: &mut Vec<u8>,
     cell: Cell,
@@ -309,7 +348,14 @@ fn push_cell(
         let params = style_params(cell.style, m);
         // None == terminal still in the reset state, i.e. equivalent to "0".
         if cur.unwrap_or("0") != params {
-            push_sgr(out, params);
+            if params == "0" {
+                push_sgr(out, "0");
+            } else {
+                let mut p = String::with_capacity(params.len() + 2);
+                p.push_str("0;");
+                p.push_str(params);
+                push_sgr(out, &p);
+            }
             *cur = Some(params);
         }
     }
@@ -1040,8 +1086,304 @@ mod tests {
         let out = render_ansi(Some(&f2), &f1, false);
         let s = String::from_utf8(out).unwrap();
         assert!(!s.contains("38;5;"), "no color SGR in mono mode: {s}");
-        assert!(s.contains("\x1b[1m"), "bold attribute present in mono mode");
-        assert!(s.contains("\x1b[2m"), "dim attribute present in mono mode");
+        assert!(
+            s.contains("\x1b[0;1m"),
+            "self-contained bold attribute present in mono mode: {s}"
+        );
+        assert!(
+            s.contains("\x1b[0;2m"),
+            "self-contained dim attribute present in mono mode: {s}"
+        );
+    }
+
+    // ------------------------------------------- SGR terminal simulator
+
+    /// Attributes a terminal holds for a character.
+    #[derive(Clone, PartialEq, Debug, Default)]
+    struct TermAttrs {
+        bold: bool,
+        dim: bool,
+        fg: Option<u8>,
+    }
+
+    /// Minimal VT parser: tracks SGR state and a screen of (char, attrs-at-write).
+    /// Exactly the state machine a real terminal applies — the point of these tests.
+    struct Term {
+        attrs: TermAttrs,
+        cx: usize,
+        cy: usize,
+        screen: Vec<Vec<(char, TermAttrs)>>,
+    }
+    impl Term {
+        fn new(w: usize, h: usize) -> Self {
+            Term {
+                attrs: TermAttrs::default(),
+                cx: 0,
+                cy: 0,
+                screen: vec![vec![(' ', TermAttrs::default()); w]; h],
+            }
+        }
+        fn feed(&mut self, bytes: &[u8]) {
+            let s = String::from_utf8(bytes.to_vec()).unwrap();
+            let mut it = s.chars().peekable();
+            while let Some(c) = it.next() {
+                match c {
+                    '\x1b' => {
+                        assert_eq!(it.next(), Some('['), "only CSI expected");
+                        let mut seq = String::new();
+                        let fin = loop {
+                            let f = it.next().expect("unterminated CSI");
+                            if f.is_ascii_alphabetic() {
+                                break f;
+                            }
+                            seq.push(f);
+                        };
+                        match fin {
+                            'm' => self.sgr(&seq),
+                            'H' => {
+                                let mut parts = seq.split(';');
+                                let r: usize = parts.next().unwrap_or("").parse().unwrap_or(1);
+                                let c: usize = parts.next().unwrap_or("").parse().unwrap_or(1);
+                                self.cy = r - 1;
+                                self.cx = c - 1;
+                            }
+                            _ => {}
+                        }
+                    }
+                    '\r' => self.cx = 0,
+                    '\n' => self.cy += 1,
+                    other => {
+                        self.screen[self.cy][self.cx] = (other, self.attrs.clone());
+                        self.cx += 1;
+                    }
+                }
+            }
+        }
+        /// Apply an SGR parameter list like a terminal does (sticky attributes).
+        fn sgr(&mut self, seq: &str) {
+            let params: Vec<i64> = seq
+                .split(';')
+                .map(|p| if p.is_empty() { 0 } else { p.parse().unwrap() })
+                .collect();
+            let mut i = 0;
+            while i < params.len() {
+                match params[i] {
+                    0 => self.attrs = TermAttrs::default(),
+                    1 => self.attrs.bold = true,
+                    2 => self.attrs.dim = true,
+                    22 => {
+                        self.attrs.bold = false;
+                        self.attrs.dim = false;
+                    }
+                    39 => self.attrs.fg = None,
+                    38 => {
+                        assert!(params[i + 1] == 5, "only 256-color SGR expected");
+                        self.attrs.fg = Some(params[i + 2] as u8);
+                        i += 2;
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+        }
+        /// The attrs a style must render with: a fresh parse of its param string
+        /// starting from reset — self-contained by construction.
+        fn expected(style: Style, color: bool) -> TermAttrs {
+            let mut t = Term {
+                attrs: TermAttrs::default(),
+                cx: 0,
+                cy: 0,
+                screen: vec![],
+            };
+            let mode = if color { "full" } else { "mono" };
+            let params = match (style, mode) {
+                (Style::Blank, _) | (Style::DaySea, _) => "0",
+                (Style::DayLand, "mono") => "1",
+                (Style::DayLand, _) => "1;38;5;114",
+                (Style::TwiSea, "mono") | (Style::TwiLand, "mono") => "0",
+                (Style::TwiSea, _) => "38;5;244",
+                (Style::TwiLand, _) => "38;5;246",
+                (Style::NightSea, "mono") | (Style::NightLand, "mono") => "2",
+                (Style::NightSea, _) => "2;38;5;238",
+                (Style::NightLand, _) => "2;38;5;244",
+                (Style::Terminator, "mono") => "1",
+                (Style::Terminator, _) => "1;38;5;214",
+                (Style::Clock, _) => "1",
+            };
+            let full = if params == "0" {
+                "0".to_string()
+            } else {
+                format!("0;{params}")
+            };
+            t.sgr(&full);
+            t.attrs
+        }
+    }
+
+    /// Feed a frame sequence (full then diffs) through the simulator and require
+    /// every screen cell to carry exactly the attributes its style mandates —
+    /// across style flips, clock updates, both color modes. Regression test for
+    /// the sticky-SGR bugs (stale dim/color bleeding into later runs).
+    #[test]
+    fn sgr_stream_renders_exact_attributes() {
+        let rings = vec![
+            box_ring(30.0, 60.0, -10.0, 30.0),
+            box_ring(-60.0, -20.0, 100.0, 170.0),
+        ];
+        for &color in &[true, false] {
+            let sun1 = Sun {
+                decl_deg: 23.44,
+                lon_deg: 0.0,
+            };
+            let sun2 = Sun {
+                decl_deg: -23.44,
+                lon_deg: 90.0,
+            }; // flips shading globally
+            let f1 = compose(&params(W, H, &rings, sun1, false, true, "AAAA 00:00:00 A"));
+            let f2 = compose(&params(W, H, &rings, sun2, false, true, "BBBB 11:11:11 B"));
+            let mut f3 = f2.clone();
+            let cl = Cell {
+                sym: '2',
+                style: Style::Clock,
+            };
+            let pos = (0..W).find(|&x| f2.get(x, H - 1).sym == '1').unwrap();
+            f3.set(pos, H - 1, cl); // clock-only second tick
+
+            let mut term = Term::new(W, H);
+            term.feed(&render_ansi(None, &f1, color));
+            assert_screen(&term, &f1, color);
+            term.feed(&render_ansi(Some(&f1), &f2, color));
+            assert_screen(&term, &f2, color);
+            term.feed(&render_ansi(Some(&f2), &f3, color));
+            assert_screen(&term, &f3, color);
+        }
+    }
+
+    fn assert_screen(term: &Term, f: &Frame, color: bool) {
+        for y in 0..f.h {
+            for x in 0..f.w {
+                let (ch, attrs) = term.screen[y][x].clone();
+                let cell = f.get(x, y);
+                assert_eq!(ch, cell.sym, "screen char at ({x},{y})");
+                assert_eq!(
+                    attrs,
+                    Term::expected(cell.style, color),
+                    "attributes at ({x},{y}) style {:?}: stale SGR state leaked",
+                    cell.style
+                );
+            }
+        }
+    }
+
+    /// Direct regression for the reported clock bug: a diff run that touches dim
+    /// night cells *before* the clock row must not leave dim/color on the clock.
+    #[test]
+    fn no_stale_dim_or_color_before_clock_run() {
+        let f1 = Frame::new(12, 2, Cell::BLANK);
+        let mut f2 = f1.clone();
+        f2.set(
+            0,
+            0,
+            Cell {
+                sym: '\u{28ff}',
+                style: Style::NightLand,
+            },
+        );
+        f2.set(
+            1,
+            0,
+            Cell {
+                sym: '\u{28ff}',
+                style: Style::TwiLand,
+            },
+        );
+        f2.set(
+            5,
+            1,
+            Cell {
+                sym: '7',
+                style: Style::Clock,
+            },
+        );
+        let bytes = render_ansi(Some(&f1), &f2, true);
+        let mut term = Term::new(12, 2);
+        term.feed(&bytes);
+        let attrs = term.screen[1][5].1.clone();
+        assert_eq!(
+            attrs,
+            TermAttrs {
+                bold: true,
+                dim: false,
+                fg: None
+            },
+            "clock must render plain bold, not the night run's dim/color"
+        );
+        let twi = term.screen[0][1].1.clone();
+        assert_eq!(twi.fg, Some(246), "twilight land keeps its color");
+        assert!(!twi.dim, "night dim must not leak into twilight land");
+    }
+
+    // ------------------------------------------- oval border granularity
+
+    /// The map border must live on the dot grid: cells whose center is outside
+    /// the oval but that contain inside-dots render (partial braille / styled
+    /// sea), fully-outside cells stay BLANK, and no braille dot is ever set
+    /// outside the oval. Regression for the whole-cell jagged border.
+    #[test]
+    fn map_border_is_dot_granular() {
+        let cell_bits: [[u8; 4]; 2] = [[0x01, 0x02, 0x04, 0x40], [0x08, 0x10, 0x20, 0x80]];
+        for &(w, h) in &[(80usize, 24usize), (120, 40)] {
+            let sun = Sun {
+                decl_deg: 10.0,
+                lon_deg: 0.0,
+            };
+            let rings = vec![box_ring(30.0, 60.0, -10.0, 30.0)];
+            let f = compose(&params(w, h, &rings, sun, false, false, "clock"));
+            let mf = geo::MapFrame::new(2 * (w - 2), 4 * (h - 2), 0.0);
+
+            let mut partial = 0usize;
+            for cy in 0..h - 2 {
+                for cx in 0..w - 2 {
+                    let mut oval = 0u8;
+                    for (col, bits_col) in cell_bits.iter().enumerate() {
+                        for (row, bit) in bits_col.iter().enumerate() {
+                            if mf.dot_to_lonlat(2 * cx + col, 4 * cy + row).is_some() {
+                                oval |= bit;
+                            }
+                        }
+                    }
+                    let cell = f.get(cx + 1, cy);
+                    if oval == 0 {
+                        assert_eq!(cell, Cell::BLANK, "({cx},{cy}) fully outside oval");
+                    } else {
+                        assert_ne!(
+                            cell,
+                            Cell::BLANK,
+                            "({cx},{cy}) has inside dots: must render, not blank"
+                        );
+                        let popcount = oval.count_ones();
+                        if popcount < 8 {
+                            partial += 1;
+                        }
+                        // No braille dot outside the oval in any rendered glyph.
+                        if let Some(mask) = (cell.sym as u32).checked_sub(0x2800) {
+                            let mask = mask as u8;
+                            assert_eq!(
+                                mask & !oval,
+                                0,
+                                "({cx},{cy}) glyph has dots outside the oval: {:08b} vs {:08b}",
+                                mask,
+                                oval
+                            );
+                        }
+                    }
+                }
+            }
+            assert!(
+                partial > 10,
+                "expected many partial-border cells at {w}x{h}, got {partial}"
+            );
+        }
     }
 
     // ----------------------------------------------------- render_plain
@@ -1073,7 +1415,10 @@ mod tests {
         let out = render_plain(&f, true);
         let s = String::from_utf8(out).unwrap();
         assert!(s.contains("38;5;214"), "terminator accent color expected");
-        assert!(s.contains("\x1b[1m"), "bold expected for day land / clock");
+        assert!(
+            s.contains("\x1b[0;1m"),
+            "self-contained bold expected for day land / clock"
+        );
         assert_eq!(
             count_cursor_moves(s.as_bytes()),
             0,

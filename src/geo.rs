@@ -75,7 +75,9 @@ impl MapFrame {
     }
 
     /// Uniform dots-per-map-unit scale: the bbox fits inside the dot grid.
-    fn scale(&self) -> f64 {
+    /// `pub(crate)`: the raster scanline must use the identical mapping so land and
+    /// shading/terminator layers stay registered to the dot.
+    pub(crate) fn scale(&self) -> f64 {
         let sx = self.dots_w as f64 / (self.x_max - self.x_min);
         let sy = self.dots_h as f64 / (self.y_max - self.y_min);
         if sx < sy {
@@ -86,7 +88,8 @@ impl MapFrame {
     }
 
     /// Map-space (x, y) of a dot's center; dy = 0 is the top (north) row.
-    fn dot_center(&self, dx: usize, dy: usize) -> (f64, f64) {
+    /// `pub(crate)` for the same registration reason as [`Self::scale`].
+    pub(crate) fn dot_center(&self, dx: usize, dy: usize) -> (f64, f64) {
         let s = self.scale();
         let x = (dx as f64 + 0.5 - self.dots_w as f64 / 2.0) / s;
         let y = (self.dots_h as f64 / 2.0 - (dy as f64 + 0.5)) / s;

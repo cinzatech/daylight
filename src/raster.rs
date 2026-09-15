@@ -214,13 +214,15 @@ fn seam_edges(lats: &[f64], lon: f64, edges: &mut Vec<Edge>) {
 /// Geographic scanline even-odd land fill (PLAN §8).
 ///
 /// For each dot row (one latitude — parallels are straight in this projection) the row's
-/// latitude is taken directly from the frame's y mapping (`y == lat` in Kavrayskiy VII;
-/// `dy = 0` is the top/north row). Edges are pre-split at the antimeridian relative to
-/// the frame's central meridian, crossings with the row latitude are collected
-/// (eastward ray-cast, half-open vertex rule, vertex-exact rows nudged by +1e-9 rad),
-/// sorted, and filled pairwise. Span longitudes become dot columns through the forward
-/// projection x and the frame's x scale: `dx = (x − x_min)/(x_max − x_min) · dots_w`.
-/// Dots are OR-ed into the canvas; the caller clears as needed.
+/// latitude comes from the frame's own dot-center mapping (`MapFrame::dot_center`), so
+/// land, shading, and curve layers are registered to the exact same dot grid. Edges are
+/// pre-split at the antimeridian relative to the frame's central meridian, crossings
+/// with the row latitude are collected (eastward ray-cast, half-open vertex rule,
+/// vertex-exact rows nudged by +1e-9 rad), sorted, and filled pairwise. Span longitudes
+/// become fractional dot columns through the forward projection x and the frame's
+/// uniform scale: `fx = x · scale + dots_w/2 − 0.5`; a dot is set when its *center*
+/// (`dx as f64`) lies inside the span. Dots are OR-ed into the canvas; the caller
+/// clears/filters as needed.
 pub fn draw_land(canvas: &mut Canvas, frame: &geo::MapFrame, rings: &[coast::Ring]) {
     let (dw, dh) = (frame.dots_w, frame.dots_h);
     if dw == 0 || dh == 0 || frame.x_max <= frame.x_min || frame.y_max <= frame.y_min {
@@ -237,12 +239,13 @@ pub fn draw_land(canvas: &mut Canvas, frame: &geo::MapFrame, rings: &[coast::Rin
     }
 
     let lat_eps = 1e-9; // nudge rows that exactly hit a vertex latitude
-    let x_scale = dw as f64 / (frame.x_max - frame.x_min);
+    let s = frame.scale();
+    let half_w = dw as f64 / 2.0;
     let mut crossings: Vec<f64> = Vec::new();
 
     for dy in 0..dh {
-        // Row latitude: dy = 0 is the top (north) row at y_max; y == lat.
-        let lat = frame.y_max - (frame.y_max - frame.y_min) * (dy as f64) / (dh as f64);
+        // Row latitude from the frame's dot-center y (dy = 0 is the top/north row).
+        let lat = frame.dot_center(0, dy).1;
         let lat_t = lat + lat_eps;
 
         crossings.clear();
@@ -260,10 +263,11 @@ pub fn draw_land(canvas: &mut Canvas, frame: &geo::MapFrame, rings: &[coast::Rin
 
         for pair in crossings.chunks(2) {
             if let [c0, c1] = pair {
-                let f0 = (kav_x(*c0, lat) - frame.x_min) * x_scale;
-                let f1 = (kav_x(*c1, lat) - frame.x_min) * x_scale;
-                // Every integer dot column inside the span (inclusive, with a tiny
-                // tolerance for exact-boundary rounding).
+                // Fractional dot-column of each span end (dot centers sit on integers).
+                let f0 = (kav_x(*c0, lat)) * s + half_w - 0.5;
+                let f1 = (kav_x(*c1, lat)) * s + half_w - 0.5;
+                // Every dot whose center lies inside the span (tiny tolerance for
+                // exact-boundary rounding).
                 let a = ((f0 - 1e-9).ceil() as i64).max(0);
                 let b = ((f1 + 1e-9).floor() as i64).min(dw as i64 - 1);
                 for dx in a..=b {
@@ -295,20 +299,18 @@ mod tests {
         }
     }
 
-    /// Row latitude for a dot row — mirrors draw_land's y mapping (dy = 0 = north).
+    /// Row latitude for a dot row — the frame's own dot-center mapping (dy = 0 = north).
     fn row_lat(frame: &geo::MapFrame, dy: usize) -> f64 {
-        frame.y_max - (frame.y_max - frame.y_min) * dy as f64 / frame.dots_h as f64
+        frame.dot_center(0, dy).1
     }
 
-    /// Nearest dot for a geographic probe point (degrees), using the frame's layout.
+    /// Nearest dot for a geographic probe point (degrees), using the frame's mapping.
     fn dot_for(frame: &geo::MapFrame, lon_deg: f64, lat_deg: f64) -> (usize, usize) {
-        let lat = lat_deg.to_radians();
-        let k = (1.0 / 3.0 - (lat / PI).powi(2)).sqrt();
-        let lon_rel = normalize_lon_r(lon_deg.to_radians() - frame.lambda0);
-        let x = 1.5 * lon_rel * k;
-        let fx = (x - frame.x_min) / (frame.x_max - frame.x_min) * frame.dots_w as f64;
+        let (x, y) = geo::forward(lon_deg.to_radians(), lat_deg.to_radians(), frame.lambda0);
+        let s = frame.scale();
+        let fx = x * s + frame.dots_w as f64 / 2.0 - 0.5;
+        let fy = frame.dots_h as f64 / 2.0 - y * s - 0.5;
         let dx = fx.round().clamp(0.0, frame.dots_w as f64 - 1.0) as usize;
-        let fy = (frame.y_max - lat) / (frame.y_max - frame.y_min) * frame.dots_h as f64;
         let dy = fy.round().clamp(0.0, frame.dots_h as f64 - 1.0) as usize;
         (dx, dy)
     }
@@ -415,9 +417,9 @@ mod tests {
             let row_in = latd > -10.0 + LAT_M && latd < 10.0 - LAT_M;
             let row_out = latd > 10.0 + LAT_M || latd < -10.0 - LAT_M;
             let k = (1.0 / 3.0 - (lat / PI).powi(2)).sqrt();
-            let fx = |lon_deg: f64| {
-                (1.5 * lon_deg.to_radians() * k - f.x_min) / (f.x_max - f.x_min) * f.dots_w as f64
-            };
+            let s = f.scale();
+            let half_w = f.dots_w as f64 / 2.0;
+            let fx = |lon_deg: f64| 1.5 * lon_deg.to_radians() * k * s + half_w - 0.5;
             let (s0, s1) = (fx(-20.0), fx(20.0));
             for dx in 0..f.dots_w {
                 let p = dx as f64;
