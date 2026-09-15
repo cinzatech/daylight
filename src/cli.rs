@@ -27,6 +27,10 @@ pub struct Args {
     #[arg(long)]
     pub no_outline: bool,
 
+    /// Do not slowly rotate the map (one full turn in ~6 minutes).
+    #[arg(long)]
+    pub no_rotate: bool,
+
     /// Render without braille ('#' land, '.' terminator) for limited fonts.
     #[arg(long)]
     pub ascii: bool,
@@ -40,7 +44,7 @@ pub struct Args {
     pub once: bool,
 }
 
-const INTERACTIVE_HELP: &str = "Interactive keys:\n  q, Esc, Ctrl-C    quit (Ctrl-C exits 130)\n  Ctrl-Z            suspend (restore on resume)\n  u                 toggle UTC/local clock\n  c                 re-center map to current timezone\n  t                 toggle twilight curve\n  o                 toggle map-oval outline\n  r                 force repaint\n\nThe clock runs in the timezone current at startup (or UTC with --utc); only the\nmap center is pinned at startup — press c to re-center live.";
+const INTERACTIVE_HELP: &str = "Interactive keys:\n  q, Esc, Ctrl-C    quit (Ctrl-C exits 130)\n  Ctrl-Z            suspend (restore on resume)\n  u                 toggle UTC/local clock\n  c                 re-center map to current timezone\n  t                 toggle twilight curve\n  o                 toggle map-oval outline\n  a                 toggle slow rotation\n  r                 force repaint\n\nThe clock runs in the timezone current at startup (or UTC with --utc); only the\nmap center is pinned at startup — press c to re-center live.";
 
 fn parse_center(s: &str) -> Result<f64, String> {
     let v: f64 = s.parse().map_err(|_| format!("invalid number: {s}"))?;
@@ -73,6 +77,7 @@ pub struct Config {
     pub utc: bool,
     pub twilight: bool,
     pub outline: bool,
+    pub rotate: bool,
     pub ascii: bool,
     pub color: ColorWhen,
     pub once: bool,
@@ -105,6 +110,7 @@ pub fn parse() -> Config {
         utc: args.utc,
         twilight: args.twilight,
         outline: !args.no_outline,
+        rotate: !args.no_rotate,
         ascii: args.ascii,
         color: match args.color {
             ColorArg::Auto => ColorWhen::Auto,

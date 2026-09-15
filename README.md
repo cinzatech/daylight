@@ -41,6 +41,7 @@ Options:
       --utc            Clock in UTC; central meridian 0°
       --twilight       Also draw the civil twilight (−6°) curve
       --no-outline     Do not draw the one-dot outline around the map oval
+      --no-rotate      Do not slowly rotate the map (one turn in ~6 min)
       --ascii          Render without braille ('#' land, '.' terminator) for limited fonts
       --color <WHEN>   When to use color: auto | always | never  [default: auto]
       --once           Render one frame to stdout and exit (implied when stdout is not a TTY)
@@ -59,6 +60,7 @@ Options:
 | `c` | re-center the map to the current timezone |
 | `t` | toggle the civil twilight curve |
 | `o` | toggle the map-oval outline |
+| `a` | toggle slow rotation |
 | `r` | force repaint |
 
 ### Examples
@@ -69,6 +71,7 @@ daylight --utc            # UTC clock, Greenwich-centered map
 daylight --center 90      # map centered on 90°E
 daylight --twilight       # also draw the −6° twilight curve
 daylight --no-outline     # no map-oval outline
+daylight --no-rotate      # static map instead of slow rotation
 daylight --ascii          # '#'/'.' glyphs instead of braille
 daylight --once > map.txt # one static frame (also automatic when piping)
 ```
@@ -77,7 +80,8 @@ daylight --once > map.txt # one static frame (also automatic when piping)
 
 - The clock runs in the timezone current at startup; DST transitions while running
   are still shown correctly. Only the map's central meridian is pinned at startup —
-  press `c` to re-center live.
+  press `c` to re-center live. By default the map slowly rotates eastward
+  (one full turn in ~6 minutes; `--no-rotate` or `a` to stop).
 - Honors `NO_COLOR` and `TERM=dumb`; degrades to dim/bold attributes without color.
 - Well-mannered terminal citizen: alternate screen, symmetric raw-mode
   setup/teardown (also on panics and signals), no bell, no mouse capture, scrollback

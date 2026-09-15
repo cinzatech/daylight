@@ -74,6 +74,7 @@ struct App {
     use_utc: bool,
     twilight: bool,
     outline: bool,
+    rotate: bool,
     ascii: bool,
     color: bool,
     rings: Vec<coast::Ring>,
@@ -81,6 +82,22 @@ struct App {
     prev: Option<Frame>,
     last_minute: Option<i64>,
     last_second: Option<i64>,
+    /// Wall-clock anchor for the slow rotation (dt is measured from this).
+    rotate_anchor: Option<chrono::DateTime<Utc>>,
+}
+
+/// Slow auto-rotation speed: one degree per second eastward — a full turn in
+/// six minutes, gentle enough to watch, fast enough to notice.
+const ROTATE_DEG_PER_SEC: f64 = 1.0;
+
+/// Advance a central meridian by `deg_per_sec * dt_secs`, wrapped to (-180, 180].
+fn advance_center(current: f64, deg_per_sec: f64, dt_secs: f64) -> f64 {
+    let d = current + deg_per_sec * dt_secs;
+    let mut d = d.rem_euclid(360.0);
+    if d > 180.0 {
+        d -= 360.0;
+    }
+    d
 }
 
 impl App {
@@ -141,6 +158,15 @@ impl App {
                 self.outline = !self.outline;
                 Some(LoopCtl::DirtyFull)
             }
+            (KeyCode::Char('a') | KeyCode::Char('A'), _) => {
+                self.rotate = !self.rotate;
+                self.rotate_anchor = None; // re-anchor on resume
+                if !self.rotate {
+                    Some(LoopCtl::Dirty)
+                } else {
+                    None // next wake redraws with the advanced meridian
+                }
+            }
             (KeyCode::Char('r') | KeyCode::Char('R'), _) => Some(LoopCtl::DirtyFull),
             _ => None,
         }
@@ -169,6 +195,7 @@ fn run_interactive(cfg: &Config, color: bool, rings: &[coast::Ring]) -> i32 {
         use_utc: cfg.utc,
         twilight: cfg.twilight,
         outline: cfg.outline,
+        rotate: cfg.rotate,
         ascii: cfg.ascii,
         color,
         rings: rings.to_vec(),
@@ -176,17 +203,33 @@ fn run_interactive(cfg: &Config, color: bool, rings: &[coast::Ring]) -> i32 {
         prev: None,
         last_minute: None,
         last_second: None,
+        rotate_anchor: None,
     };
 
     loop {
         let now = Utc::now();
+
+        // Slow rotation: advance the central meridian by the elapsed wall time,
+        // then force a redraw each wake (the clock redraws every second anyway).
+        if app.rotate {
+            match app.rotate_anchor.replace(now) {
+                Some(anchor) => {
+                    let dt = (now - anchor).num_milliseconds() as f64 / 1000.0;
+                    app.lambda0_deg = advance_center(app.lambda0_deg, ROTATE_DEG_PER_SEC, dt);
+                }
+                None => { /* anchor set; rotation starts on the next wake */ }
+            }
+        } else {
+            app.rotate_anchor = None;
+        }
+        let rotated = app.rotate;
 
         // Redraw only when something changed since our last drawn state.
         let minute_key = now.timestamp() / 60;
         let second_key = now.timestamp();
         let minute_changed = app.last_minute.map(|m| m != minute_key).unwrap_or(true);
         let second_changed = app.last_second.map(|s| s != second_key).unwrap_or(true);
-        if app.prev.is_none() || minute_changed || second_changed {
+        if app.prev.is_none() || rotated || minute_changed || second_changed {
             // First frame or resize => full repaint; shading recompute on minute change.
             let full = app.prev.is_none();
             app.redraw(now, full);
@@ -243,5 +286,26 @@ fn run_interactive(cfg: &Config, color: bool, rings: &[coast::Ring]) -> i32 {
         if term::take_resume_request() {
             app.prev = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{advance_center, ROTATE_DEG_PER_SEC};
+
+    #[test]
+    fn advance_center_basic_and_wrap() {
+        // Plain advance.
+        assert!((advance_center(10.0, 1.0, 5.0) - 15.0).abs() < 1e-12);
+        // Negative dt (clock skew tolerance) still normalizes.
+        assert!((advance_center(10.0, 1.0, -5.0) - 5.0).abs() < 1e-12);
+        // Wrap past +180 into the western hemisphere.
+        assert!((advance_center(179.0, 1.0, 3.0) - (-178.0)).abs() < 1e-12);
+        // Wrap from -180 side.
+        assert!((advance_center(-179.0, 1.0, -3.0) - 178.0).abs() < 1e-12);
+        // Full turn returns to the start.
+        assert!((advance_center(42.0, 1.0, 360.0) - 42.0).abs() < 1e-12);
+        // One rotation period at the configured speed.
+        assert!((advance_center(0.0, ROTATE_DEG_PER_SEC, 360.0) - 0.0).abs() < 1e-12);
     }
 }
