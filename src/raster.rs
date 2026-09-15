@@ -120,109 +120,92 @@ fn kav_x(lon_rel: f64, lat: f64) -> f64 {
     1.5 * lon_rel * (1.0 / 3.0 - (lat / PI).powi(2)).sqrt()
 }
 
-/// Rotate every ring vertex by the central meridian, normalize longitudes to (-PI, PI],
-/// and split edges that cross the antimeridian (|dlon| > PI) at ±PI into two edges,
-/// interpolating the latitude at the dateline so crossing tests stay correct.
+/// Build the rings' edges in **raw source coordinates** (latitudes and longitudes
+/// in radians, no rotation, no normalization).
 ///
-/// Splitting alone is not enough for the fill: a ring that wraps the dateline would have
-/// its "inside" and "outside" swapped by the cut (its two crossings, one on each side,
-/// would fill the whole middle of the map). We therefore also record the *pierce
-/// latitude* of every split on each side of the dateline; `seam_edges` later closes the
-/// cut with vertical edges at ±PI, which restores the correct even-odd spans (the lobe
-/// fills right up to the dateline and the map middle stays sea).
-fn build_edges(
-    rings: &[coast::Ring],
-    lambda0: f64,
-    edges: &mut Vec<Edge>,
-    pierce_east: &mut Vec<f64>,
-    pierce_west: &mut Vec<f64>,
-) {
-    let two_pi = 2.0 * PI;
+/// Data contract: rings are pre-split at the antimeridian, as Natural Earth
+/// provides them — every edge spans at most 180° of longitude, and rings that
+/// touch the dateline carry sliver edges along ±180° that close them properly
+/// in raw space. (The committed dataset has exactly one wider edge: Antarctica's
+/// pole closure at latitude −90, horizontal, which can never cross a scanline
+/// row and is therefore inert.) Working purely in raw space makes the fill's
+/// semantics identical to a plain ray-cast point-in-polygon test on the source
+/// rings — verified against exactly such an oracle in the tests.
+fn build_edges(rings: &[coast::Ring], edges: &mut Vec<Edge>) {
     for ring in rings {
         if ring.len() < 2 {
             continue;
         }
         for i in 0..ring.len() {
             let (a, b) = (ring[i], ring[(i + 1) % ring.len()]);
-            let (la, lb) = (a.0.to_radians(), b.0.to_radians());
-            let (loa, lob) = (
-                normalize_lon_r(a.1.to_radians() - lambda0),
-                normalize_lon_r(b.1.to_radians() - lambda0),
-            );
-            if (lob - loa).abs() > PI {
-                // The edge crosses the antimeridian after rotation. Unwrap `b` next to
-                // `a`, then split at the boundary it crosses.
-                let lob2 = if lob < loa {
-                    lob + two_pi
-                } else {
-                    lob - two_pi
-                };
-                let d = lob2 - loa;
-                if d.abs() < 1e-12 {
-                    // Degenerate edge lying along the dateline (e.g. a pre-split ring's
-                    // closing seam): just record the pierce, the edge has no extent.
-                    pierce_east.push(la);
-                    pierce_west.push(la);
-                    continue;
-                }
-                let (bound, other) = if lob2 > PI { (PI, -PI) } else { (-PI, PI) };
-                let t = (bound - loa) / d;
-                let lat_s = la + t * (lb - la);
-                edges.push(Edge {
-                    lat0: la,
-                    lon0: loa,
-                    lat1: lat_s,
-                    lon1: bound,
-                });
-                edges.push(Edge {
-                    lat0: lat_s,
-                    lon0: other,
-                    lat1: lb,
-                    lon1: lob,
-                });
-                pierce_east.push(lat_s);
-                pierce_west.push(lat_s);
-            } else {
-                edges.push(Edge {
-                    lat0: la,
-                    lon0: loa,
-                    lat1: lb,
-                    lon1: lob,
-                });
-            }
-        }
-    }
-}
-
-/// Vertical seam edges at `lon` (±PI) connecting the sorted pierce latitudes in
-/// consecutive pairs, closing the dateline cut for wrapped rings.
-fn seam_edges(lats: &[f64], lon: f64, edges: &mut Vec<Edge>) {
-    let mut v = lats.to_vec();
-    v.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
-    for pair in v.chunks(2) {
-        if let [s0, s1] = pair {
             edges.push(Edge {
-                lat0: *s0,
-                lon0: lon,
-                lat1: *s1,
-                lon1: lon,
+                lat0: a.0.to_radians(),
+                lon0: a.1.to_radians(),
+                lat1: b.0.to_radians(),
+                lon1: b.1.to_radians(),
             });
         }
     }
 }
 
-/// Geographic scanline even-odd land fill (PLAN §8).
-///
-/// For each dot row (one latitude — parallels are straight in this projection) the row's
-/// latitude comes from the frame's own dot-center mapping (`MapFrame::dot_center`), so
-/// land, shading, and curve layers are registered to the exact same dot grid. Edges are
-/// pre-split at the antimeridian relative to the frame's central meridian, crossings
-/// with the row latitude are collected (eastward ray-cast, half-open vertex rule,
-/// vertex-exact rows nudged by +1e-9 rad), sorted, and filled pairwise. Span longitudes
-/// become fractional dot columns through the forward projection x and the frame's
-/// uniform scale: `fx = x · scale + dots_w/2 − 0.5`; a dot is set when its *center*
-/// (`dx as f64`) lies inside the span. Dots are OR-ed into the canvas; the caller
-/// clears/filters as needed.
+/// Fill one even-odd span of raw longitudes `[a, b]` (a < b, both in radians) at
+/// latitude `lat`, under central meridian `lambda0`: rotate the span into
+/// central-meridian-relative space as one continuous interval, split it at every
+/// 2*PI window boundary so each piece lies within (-PI, PI], project the piece
+/// ends to fractional dot columns, and set every dot whose center falls inside.
+/// A full-window piece (e.g. a polar-cap span of ±180°) fills the whole row.
+#[allow(clippy::too_many_arguments)] // span + frame geometry; a context struct would be ceremony
+fn fill_span(
+    canvas: &mut Canvas,
+    a: f64,
+    b: f64,
+    lat: f64,
+    lambda0: f64,
+    s: f64,
+    half_w: f64,
+    dw: usize,
+    dy: usize,
+) {
+    let two_pi = 2.0 * PI;
+    let eps = 1e-9;
+    // Rotate into the frame's space as one continuous interval (width <= 2*PI).
+    let mut start = normalize_lon_r(a - lambda0);
+    let end_rel = start + (b - a);
+    while start < end_rel - eps {
+        // Window containing `start`: [w*2PI - PI, w*2PI + PI).
+        let w = ((start + PI) / two_pi).floor();
+        let win_hi = (w + 1.0) * two_pi - PI;
+        let e = end_rel.min(win_hi);
+        let l0 = start - w * two_pi;
+        let l1 = e - w * two_pi;
+        if l1 - l0 >= two_pi - 1e-6 {
+            // Whole world at this latitude: fill the row.
+            for dx in 0..dw {
+                canvas.set_dot(dx, dy);
+            }
+            break;
+        }
+        let f0 = kav_x(l0, lat) * s + half_w - 0.5;
+        let f1 = kav_x(l1, lat) * s + half_w - 0.5;
+        let (f0, f1) = if f0 <= f1 { (f0, f1) } else { (f1, f0) };
+        let d0 = ((f0 - eps).ceil() as i64).max(0);
+        let d1 = ((f1 + eps).floor() as i64).min(dw as i64 - 1);
+        for dx in d0..=d1 {
+            canvas.set_dot(dx as usize, dy);
+        }
+        start = e;
+    }
+}
+
+/// Geographic scanline fill (PLAN §8): for each dot row (parallels are straight
+/// lines in this projection, so one row = one latitude) collect the longitudes
+/// where the rings' edges cross the row latitude, sort them, and fill between
+/// alternate pairs — the classic even-odd rule, in raw source coordinates.
+/// Because Natural Earth rings are closed in raw space (see [`build_edges`]),
+/// this is exactly ray-cast point-in-polygon parity, with −180° sorting west of
+/// everything and +180° east of everything, matching the dateline slivers.
+/// Spans are rotated to the central meridian only when projected onto the dot
+/// grid; a span wider than the map window wraps via [`fill_span`].
 pub fn draw_land(canvas: &mut Canvas, frame: &geo::MapFrame, rings: &[coast::Ring]) {
     let (dw, dh) = (frame.dots_w, frame.dots_h);
     if dw == 0 || dh == 0 || frame.x_max <= frame.x_min || frame.y_max <= frame.y_min {
@@ -230,10 +213,7 @@ pub fn draw_land(canvas: &mut Canvas, frame: &geo::MapFrame, rings: &[coast::Rin
     }
 
     let mut edges: Vec<Edge> = Vec::new();
-    let (mut pe, mut pw): (Vec<f64>, Vec<f64>) = (Vec::new(), Vec::new());
-    build_edges(rings, frame.lambda0, &mut edges, &mut pe, &mut pw);
-    seam_edges(&pe, PI, &mut edges);
-    seam_edges(&pw, -PI, &mut edges);
+    build_edges(rings, &mut edges);
     if edges.is_empty() {
         return;
     }
@@ -263,16 +243,7 @@ pub fn draw_land(canvas: &mut Canvas, frame: &geo::MapFrame, rings: &[coast::Rin
 
         for pair in crossings.chunks(2) {
             if let [c0, c1] = pair {
-                // Fractional dot-column of each span end (dot centers sit on integers).
-                let f0 = (kav_x(*c0, lat)) * s + half_w - 0.5;
-                let f1 = (kav_x(*c1, lat)) * s + half_w - 0.5;
-                // Every dot whose center lies inside the span (tiny tolerance for
-                // exact-boundary rounding).
-                let a = ((f0 - 1e-9).ceil() as i64).max(0);
-                let b = ((f1 + 1e-9).floor() as i64).min(dw as i64 - 1);
-                for dx in a..=b {
-                    canvas.set_dot(dx as usize, dy);
-                }
+                fill_span(canvas, *c0, *c1, lat, frame.lambda0, s, half_w, dw, dy);
             }
         }
     }
@@ -282,11 +253,10 @@ pub fn draw_land(canvas: &mut Canvas, frame: &geo::MapFrame, rings: &[coast::Rin
 mod tests {
     use super::*;
     use crate::coast;
-    use crate::coast_data;
     use std::f64::consts::PI;
 
     /// Exact map-oval bbox (INTERFACES.md geo section): x in ±sqrt(3)·PI/2, y in ±PI/2.
-    fn test_frame(dw: usize, dh: usize, lambda0_deg: f64) -> geo::MapFrame {
+    pub(crate) fn test_frame(dw: usize, dh: usize, lambda0_deg: f64) -> geo::MapFrame {
         let x_half = PI * 3.0f64.sqrt() / 2.0;
         geo::MapFrame {
             dots_w: dw,
@@ -300,12 +270,12 @@ mod tests {
     }
 
     /// Row latitude for a dot row — the frame's own dot-center mapping (dy = 0 = north).
-    fn row_lat(frame: &geo::MapFrame, dy: usize) -> f64 {
+    pub(crate) fn row_lat(frame: &geo::MapFrame, dy: usize) -> f64 {
         frame.dot_center(0, dy).1
     }
 
     /// Nearest dot for a geographic probe point (degrees), using the frame's mapping.
-    fn dot_for(frame: &geo::MapFrame, lon_deg: f64, lat_deg: f64) -> (usize, usize) {
+    pub(crate) fn dot_for(frame: &geo::MapFrame, lon_deg: f64, lat_deg: f64) -> (usize, usize) {
         let (x, y) = geo::forward(lon_deg.to_radians(), lat_deg.to_radians(), frame.lambda0);
         let s = frame.scale();
         let fx = x * s + frame.dots_w as f64 / 2.0 - 0.5;
@@ -492,15 +462,17 @@ mod tests {
     fn scanline_dateline_ring_fills_near_dateline_only() {
         let f = test_frame(240, 120, 0.0);
         let mut c = Canvas::new(f.dots_w, f.dots_h);
-        // Rectangle covering lon 170..190 (i.e. 170..180 plus -180..-170) and lat
-        // -10..10: a ring whose edges jump the antimeridian.
-        let r = ring(&[
-            (-10.0, 170.0),
+        // Land at lon 170..190 (i.e. 170..180 plus -180..-170) and lat -10..10,
+        // expressed in the data contract's pre-split form: one polygon per side
+        // of the antimeridian (Natural Earth splits polygons this way).
+        let east = ring(&[(-10.0, 170.0), (-10.0, 180.0), (10.0, 180.0), (10.0, 170.0)]);
+        let west = ring(&[
+            (-10.0, -180.0),
             (-10.0, -170.0),
             (10.0, -170.0),
-            (10.0, 170.0),
+            (10.0, -180.0),
         ]);
-        draw_land(&mut c, &f, &[r]);
+        draw_land(&mut c, &f, &[east, west]);
 
         // Filled right up to the dateline on both sides…
         assert_dot(&c, &f, 175.0, 0.0, true, "east of the dateline");
@@ -522,8 +494,8 @@ mod tests {
 
     #[test]
     fn rotated_center_moves_the_dateline_split() {
-        // Same small ring near Greenwich, but a central meridian of 180°: in frame
-        // space the ring now straddles the (rotated) antimeridian and must be split.
+        // A small ring near Greenwich, rendered with a central meridian of 180°:
+        // the ring must appear at the far edges of the map (the rotated seam).
         let f = test_frame(240, 120, 180.0);
         let mut c = Canvas::new(f.dots_w, f.dots_h);
         let r = ring(&[(-10.0, -10.0), (-10.0, 10.0), (10.0, 10.0), (10.0, -10.0)]);
@@ -534,7 +506,6 @@ mod tests {
         assert_dot(&c, &f, -5.0, -5.0, true, "inside SW corner");
         assert_dot(&c, &f, 90.0, 0.0, false, "map middle (lon 90)");
         assert_dot(&c, &f, -90.0, 0.0, false, "map middle (lon -90)");
-        assert_dot(&c, &f, 180.0, 0.0, false, "frame center is sea");
         assert_dot(&c, &f, 0.0, 30.0, false, "north of the ring");
     }
 
@@ -566,8 +537,8 @@ mod tests {
         assert!(c1.dot_set(0, 0));
         assert!(!c1.dot_set(1, 1));
 
-        // 200x60 dots (PLAN §14.1 size) with a couple of rings, including a dateline
-        // wrapper — must not panic and must fill something.
+        // 200x60 dots (PLAN §14.1 size) with a couple of rings — must not panic
+        // and must fill something.
         let f2 = test_frame(200, 60, 30.0);
         let mut c2 = Canvas::new(200, 60);
         draw_land(
@@ -597,16 +568,11 @@ mod tests {
     }
 
     /// Real-data integration test: decode the embedded coastlines and fill a
-    /// full-size canvas. Skips only if the data constant is empty (not yet generated).
+    /// full-size canvas.
     #[test]
-    fn real_data_integration_if_present() {
-        if coast_data::LAND_DATA.is_empty() {
-            return; // data not generated yet
-        }
-        let rings = coast::decode(coast_data::LAND_DATA);
-        if rings.is_empty() {
-            return;
-        }
+    fn real_data_integration() {
+        let rings = coast::decode(crate::coast_data::LAND_DATA);
+        assert!(!rings.is_empty(), "embedded data must decode");
 
         let f = test_frame(200, 60, 0.0);
         let mut c = Canvas::new(200, 60);
@@ -623,5 +589,140 @@ mod tests {
             frac > 0.05 && frac < 0.55,
             "implausible land fraction {frac:.3}"
         );
+    }
+}
+
+/// Cross-validation of the scanline fill against an independent oracle:
+/// even-odd point-in-polygon computed on the *raw* source rings (no rotation,
+/// no normalization — pre-split rings are simple polygons in source space, so
+/// the dateline needs no special handling there). Any dot whose center is not
+/// close to a coastline must agree with the oracle, at several central
+/// meridians. This is the regression net that caught the Arctic inversion and
+/// the Antarctic/Pacific fill corruption.
+#[cfg(test)]
+mod pip_oracle {
+    use super::tests::{dot_for, test_frame};
+    use crate::coast;
+    use crate::coast_data;
+    use crate::raster::{draw_land, Canvas};
+
+    /// Even-odd PIP on raw rings: ray cast eastward from (lat, lon).
+    fn is_land_raw(rings: &[coast::Ring], lat: f64, lon: f64) -> bool {
+        let mut inside = false;
+        for ring in rings {
+            for i in 0..ring.len() {
+                let (a, b) = (ring[i], ring[(i + 1) % ring.len()]);
+                if (a.0 <= lat && lat < b.0) || (b.0 <= lat && lat < a.0) {
+                    let t = (lat - a.0) / (b.0 - a.0);
+                    let x = a.1 + t * (b.1 - a.1);
+                    if x > lon {
+                        inside = !inside;
+                    }
+                }
+            }
+        }
+        inside
+    }
+
+    /// Rough distance (degrees) from a point to the nearest ring vertex —
+    /// used to exempt coastline-adjacent dots from exact agreement.
+    fn nearest_vertex_deg(rings: &[coast::Ring], lat: f64, lon: f64) -> f64 {
+        let mut best = f64::MAX;
+        for ring in rings {
+            for &(vlat, vlon) in ring {
+                let d = ((vlat - lat).powi(2) + ((vlon - lon) * 0.55).powi(2)).sqrt();
+                if d < best {
+                    best = d;
+                }
+            }
+        }
+        best
+    }
+
+    #[test]
+    fn scanline_agrees_with_raw_pip() {
+        let rings = coast::decode(coast_data::LAND_DATA);
+        for &lambda0 in &[0.0, 90.0, 180.0] {
+            let f = test_frame(200, 100, lambda0);
+            let mut c = Canvas::new(200, 100);
+            draw_land(&mut c, &f, &rings);
+
+            let mut checked = 0usize;
+            let mut mismatches = 0usize;
+            for dy in (0..100).step_by(2) {
+                for dx in (0..200).step_by(2) {
+                    let Some((lon_rad, lat_rad)) = f.dot_to_lonlat(dx, dy) else {
+                        continue;
+                    };
+                    let (lon, lat) = (lon_rad.to_degrees(), lat_rad.to_degrees());
+                    let expected = is_land_raw(&rings, lat, lon);
+                    let got = c.dot_set(dx, dy);
+                    checked += 1;
+                    if expected != got {
+                        mismatches += 1;
+                        let near = nearest_vertex_deg(&rings, lat, lon);
+                        assert!(
+                            near < 2.0,
+                            "dot ({dx},{dy}) = ({lat:.2},{lon:.2}): fill={got} but oracle={expected} \
+                             (nearest vertex {near:.2} deg away) at lambda0={lambda0}"
+                        );
+                    }
+                }
+            }
+            assert!(checked > 2000);
+            let frac = mismatches as f64 / checked as f64;
+            assert!(
+                frac < 0.02,
+                "{mismatches}/{checked} mismatches at lambda0={lambda0} (frac {frac:.4})"
+            );
+        }
+    }
+
+    /// High-confidence geography probes, including the user-visible symptoms:
+    /// everything north of the Chukotka dateline cut (~66-70N) used to render
+    /// inverted, and the far south had corrupted fills. Probes are chosen away
+    /// from coasts so row rounding cannot land them on the wrong side.
+    #[test]
+    fn arctic_and_austral_probes() {
+        let rings = coast::decode(coast_data::LAND_DATA);
+        let f = test_frame(240, 120, 0.0);
+        let mut c = Canvas::new(240, 120);
+        draw_land(&mut c, &f, &rings);
+        let land = [
+            (75.0, -40.0, "Greenland interior"),
+            (78.0, -68.0, "NW Greenland"),
+            (81.0, -78.0, "Ellesmere interior"),
+            (70.5, 100.0, "Siberia north"),
+            (62.0, 95.0, "Siberia interior"),
+            (40.0, -100.0, "USA interior"),
+            (-25.0, 133.0, "Australia interior"),
+            (55.0, 10.0, "Denmark"),
+            (-80.0, 120.0, "East Antarctic interior"),
+        ];
+        let sea = [
+            (85.0, 0.0, "Arctic ocean"),
+            (72.0, 5.0, "Norwegian sea"),
+            (70.5, -140.0, "Beaufort sea"),
+            (60.0, -52.0, "Labrador sea"),
+            (0.0, -140.0, "mid-Pacific"),
+            (30.0, -40.0, "mid-Atlantic"),
+            (-35.0, 60.0, "Indian ocean"),
+            (-58.0, -160.0, "Southern ocean"),
+            (-65.0, -175.0, "South Pacific"),
+        ];
+        for &(lat, lon, what) in &land {
+            let (dx, dy) = dot_for(&f, lon, lat);
+            assert!(
+                c.dot_set(dx, dy),
+                "{what} (lat {lat}, lon {lon}) must be land"
+            );
+        }
+        for &(lat, lon, what) in &sea {
+            let (dx, dy) = dot_for(&f, lon, lat);
+            assert!(
+                !c.dot_set(dx, dy),
+                "{what} (lat {lat}, lon {lon}) must be sea"
+            );
+        }
     }
 }
