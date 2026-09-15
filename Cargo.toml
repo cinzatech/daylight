@@ -11,8 +11,8 @@ path = "src/main.rs"
 [dependencies]
 chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
-crossterm = "0.28"
-signal-hook = "0.3"
+crossterm = "0.29"
+signal-hook = "0.4"
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }
