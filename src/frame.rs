@@ -54,7 +54,7 @@ impl Cell {
         style: Style::Blank,
     };
 }
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Debug)]
 pub struct Frame {
     pub w: usize,
     pub h: usize,
@@ -86,6 +86,8 @@ pub struct RenderParams<'a> {
     pub rings: &'a [coast::Ring],
     pub sun: Sun,
     pub draw_twilight_curve: bool,
+    /// One-dot coastline outline around land contours (terrain-colored).
+    pub draw_coastline: bool,
     pub ascii: bool,        // '#' land, '.' terminator instead of braille
     pub clock_line: String, // pre-rendered, may be truncated by composer
 }
@@ -107,9 +109,14 @@ pub fn compose(p: &RenderParams) -> Frame {
     let dots_h = 4 * map_rows;
     let mf = geo::MapFrame::new(dots_w, dots_h, p.lambda0_deg);
 
-    // Layer 1: land fill (static per size + central meridian).
+    // Layer 1: land fill (static per size + central meridian), plus the optional
+    // coastline outline OR-ed in so it is styled as terrain (land style of the
+    // cell's shading).
     let mut land = raster::Canvas::new(dots_w, dots_h);
     raster::draw_land(&mut land, &mf, p.rings);
+    if p.draw_coastline {
+        raster::draw_coastline(&mut land, &mf, p.rings);
+    }
 
     // Layer 2: terminator curve (elevation 0); Layer 3: civil twilight (-6 deg).
     let mut terminator = raster::Canvas::new(dots_w, dots_h);
@@ -484,6 +491,7 @@ mod tests {
             rings,
             sun,
             draw_twilight_curve: twilight,
+            draw_coastline: true,
             ascii,
             clock_line: clock.to_string(),
         }
@@ -1425,5 +1433,70 @@ mod tests {
             "no cursor moves in plain output"
         );
         assert!(s.ends_with("\n"));
+    }
+}
+
+#[cfg(test)]
+mod coastline_frame_tests {
+    use super::*;
+    use crate::coast_data;
+    use chrono::{TimeZone, Utc};
+
+    /// With the coastline layer on (default), every land dot of the plain fill
+    /// survives and the frame gains terrain-styled dots along the contours.
+    #[test]
+    fn coastline_layer_adds_and_never_removes() {
+        let rings = crate::coast::decode(coast_data::LAND_DATA);
+        let t = Utc.with_ymd_and_hms(2024, 6, 21, 12, 0, 0).unwrap();
+        let sun = crate::solar::subsolar(t);
+        let mut on = RenderParams {
+            w: 100,
+            h: 30,
+            lambda0_deg: 0.0,
+            rings: &rings,
+            sun,
+            draw_twilight_curve: false,
+            draw_coastline: true,
+            ascii: false,
+            clock_line: "clock".to_string(),
+        };
+        let f_on = compose(&on);
+        on.draw_coastline = false;
+        let f_off = compose(&on);
+
+        assert_ne!(f_on, f_off, "coastline toggle must change the frame");
+        // Cell-wise: a cell that was land stays land; a cell that was sea may
+        // become land (outline) but never the reverse; glyphs only gain dots.
+        for y in 0..f_on.h {
+            for x in 0..f_on.w {
+                let (a, b) = (f_off.get(x, y), f_on.get(x, y));
+                let land =
+                    |s: Style| matches!(s, Style::DayLand | Style::TwiLand | Style::NightLand);
+                if land(a.style) {
+                    assert!(
+                        land(b.style),
+                        "coastline must not turn land into sea at ({x},{y})"
+                    );
+                    let (ma, mb) = (a.sym as u32 - 0x2800, b.sym as u32 - 0x2800);
+                    assert_eq!(
+                        ma & !mb,
+                        0,
+                        "glyph lost dots at ({x},{y}): {:08b} -> {:08b}",
+                        ma,
+                        mb
+                    );
+                }
+            }
+        }
+        // Terrain coloring: gained cells (sea -> land) carry land styles of the
+        // cell's own shading band — spot-check at least one DayLand gain.
+        let gained_day = (0..f_on.h)
+            .flat_map(|y| (0..f_on.w).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                f_on.get(x, y).style == Style::DayLand
+                    && !matches!(f_off.get(x, y).style, Style::DayLand)
+            })
+            .count();
+        assert!(gained_day > 0, "expected terrain-colored coastline gains");
     }
 }
