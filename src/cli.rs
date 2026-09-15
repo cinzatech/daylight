@@ -32,7 +32,7 @@ pub struct Args {
     pub no_rotate: bool,
 
     /// Redraw interval in milliseconds while rotating [default: 100].
-    #[arg(long, value_name = "MS", default_value_t = 100)]
+    #[arg(long = "interval", value_name = "MS", default_value_t = 100)]
     pub interval_ms: u64,
 
     /// Render without braille ('#' land, '.' terminator) for limited fonts.

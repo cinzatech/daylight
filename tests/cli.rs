@@ -118,10 +118,8 @@ fn version_prints_semver_line() {
     );
     let line = String::from_utf8(out).expect("version output is UTF-8");
     let line = line.trim();
-    assert!(
-        line.starts_with("daylight 0.1.0"),
-        "--version must print `daylight <semver>`, got: {line:?}"
-    );
+    let expect = format!("daylight {}", env!("CARGO_PKG_VERSION"));
+    assert_eq!(line, expect, "--version must print `daylight <semver>`");
 }
 
 #[test]
